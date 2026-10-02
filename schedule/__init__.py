@@ -39,11 +39,13 @@ Usage:
 """
 
 from collections.abc import Hashable
+from contextlib import nullcontext
 import datetime
 import functools
 import logging
 import random
 import re
+import threading
 import time
 from typing import Set, List, Optional, Callable, Union
 
@@ -83,8 +85,22 @@ class Scheduler:
     handle their execution.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, thread_safe: bool = False) -> None:
+        """
+        :param thread_safe: When ``True``, jobs are claimed while
+            ``run_pending()``, ``run_all()`` or ``Job.run()`` inspect the
+            scheduler. Claiming and scheduling state are protected by a lock,
+            while job functions run without holding that lock.
+        """
         self.jobs: List[Job] = []
+        self._thread_safe = thread_safe
+        self._lock = threading.RLock()
+
+    @property
+    def _scheduler_lock(self):
+        if self._thread_safe:
+            return self._lock
+        return nullcontext()
 
     def run_pending(self) -> None:
         """
@@ -95,10 +111,20 @@ class Scheduler:
         that should run every minute and you only call run_pending()
         in one hour increments then your job won't be run 60 times in
         between but only once.
+
+        A thread-safe scheduler atomically marks each selected job as running.
+        Jobs already claimed by another thread or a nested call are skipped.
         """
-        runnable_jobs = (job for job in self.jobs if job.should_run)
-        for job in sorted(runnable_jobs):
-            self._run_job(job)
+        with self._scheduler_lock:
+            runnable_jobs = [job for job in self.jobs if job.should_run]
+            if self._thread_safe:
+                runnable_jobs = [
+                    job for job in runnable_jobs if not job._running
+                ]
+                for job in runnable_jobs:
+                    job._running = True
+
+        self._run_claimed_jobs(sorted(runnable_jobs))
 
     def run_all(self, delay_seconds: int = 0) -> None:
         """
@@ -109,15 +135,48 @@ class Scheduler:
         over time.
 
         :param delay_seconds: A delay added between every executed job
+
+        A thread-safe scheduler uses the same claim rule as
+        :meth:`run_pending`, so jobs already running elsewhere are skipped.
         """
-        logger.debug(
-            "Running *all* %i jobs with %is delay in between",
-            len(self.jobs),
-            delay_seconds,
+        with self._scheduler_lock:
+            logger.debug(
+                "Running *all* %i jobs with %is delay in between",
+                len(self.jobs),
+                delay_seconds,
+            )
+            jobs = self.jobs[:]
+            if self._thread_safe:
+                jobs = [job for job in jobs if not job._running]
+                for job in jobs:
+                    job._running = True
+
+        self._run_claimed_jobs(
+            jobs, force=True, delay_seconds=delay_seconds
         )
-        for job in self.jobs[:]:
-            self._run_job(job)
-            time.sleep(delay_seconds)
+
+    def _run_claimed_jobs(
+        self,
+        jobs: List["Job"],
+        force: bool = False,
+        scheduled: bool = True,
+        delay_seconds: int = 0,
+    ) -> None:
+        next_job_index = 0
+        try:
+            for next_job_index, job in enumerate(jobs):
+                self._run_job(
+                    job,
+                    force=force,
+                    scheduled=scheduled,
+                    claimed=True,
+                )
+                time.sleep(delay_seconds)
+        finally:
+            if self._thread_safe:
+                with self._lock:
+                    for job in jobs[next_job_index + 1:]:
+                        job._running = False
 
     def get_jobs(self, tag: Optional[Hashable] = None) -> List["Job"]:
         """
@@ -127,9 +186,9 @@ class Scheduler:
         :param tag: An identifier used to identify a subset of
                     jobs to retrieve
         """
-        if tag is None:
-            return self.jobs[:]
-        else:
+        with self._scheduler_lock:
+            if tag is None:
+                return self.jobs[:]
             return [job for job in self.jobs if tag in job.tags]
 
     def clear(self, tag: Optional[Hashable] = None) -> None:
@@ -140,12 +199,15 @@ class Scheduler:
         :param tag: An identifier used to identify a subset of
                     jobs to delete
         """
-        if tag is None:
-            logger.debug("Deleting *all* jobs")
-            del self.jobs[:]
-        else:
-            logger.debug('Deleting all jobs tagged "%s"', tag)
-            self.jobs[:] = (job for job in self.jobs if tag not in job.tags)
+        with self._scheduler_lock:
+            if tag is None:
+                logger.debug("Deleting *all* jobs")
+                del self.jobs[:]
+            else:
+                logger.debug('Deleting all jobs tagged "%s"', tag)
+                self.jobs[:] = (
+                    job for job in self.jobs if tag not in job.tags
+                )
 
     def cancel_job(self, job: "Job") -> None:
         """
@@ -153,11 +215,12 @@ class Scheduler:
 
         :param job: The job to be unscheduled
         """
-        try:
-            logger.debug('Cancelling job "%s"', str(job))
-            self.jobs.remove(job)
-        except ValueError:
-            logger.debug('Cancelling not-scheduled job "%s"', str(job))
+        with self._scheduler_lock:
+            try:
+                logger.debug('Cancelling job "%s"', str(job))
+                self.jobs.remove(job)
+            except ValueError:
+                logger.debug('Cancelling not-scheduled job "%s"', str(job))
 
     def every(self, interval: int = 1) -> "Job":
         """
@@ -169,10 +232,76 @@ class Scheduler:
         job = Job(interval, self)
         return job
 
-    def _run_job(self, job: "Job") -> None:
-        ret = job.run()
+    def _run_job(
+        self,
+        job: "Job",
+        force: bool = False,
+        scheduled: bool = True,
+        claimed: bool = False,
+    ):
+        if self._thread_safe and not claimed:
+            if not self._claim_job(job, force=force, scheduled=scheduled):
+                return None
+
+        if self._thread_safe:
+            ret = self._run_claimed_job(job)
+        else:
+            ret = job.run()
+
         if isinstance(ret, CancelJob) or ret is CancelJob:
             self.cancel_job(job)
+        return ret
+
+    def _claim_job(self, job: "Job", force: bool, scheduled: bool) -> bool:
+        with self._lock:
+            if job._running:
+                return False
+            if scheduled and job not in self.jobs:
+                return False
+            if not force and not job.should_run:
+                return False
+            job._running = True
+            return True
+
+    def _run_claimed_job(self, job: "Job"):
+        previous_next_run = job.next_run
+        now = datetime.datetime.now()
+
+        if job._is_overdue(now):
+            logger.debug("Cancelling job %s", job)
+            with self._lock:
+                try:
+                    if job in self.jobs:
+                        self.jobs.remove(job)
+                finally:
+                    job._running = False
+            return CancelJob
+
+        logger.debug("Running job %s", job)
+        try:
+            ret = job.job_func()
+        except BaseException:
+            with self._lock:
+                job._running = False
+            raise
+
+        with self._lock:
+            try:
+                job.last_run = datetime.datetime.now()
+                scheduled = job in self.jobs
+                if scheduled and job.next_run is previous_next_run:
+                    job._schedule_next_run()
+
+                should_cancel = isinstance(ret, CancelJob) or ret is CancelJob
+                if scheduled and job._is_overdue(job.next_run):
+                    logger.debug("Cancelling job %s", job)
+                    should_cancel = True
+                if should_cancel and job in self.jobs:
+                    self.jobs.remove(job)
+            finally:
+                job._running = False
+
+        return ret
 
     def get_next_run(
         self, tag: Optional[Hashable] = None
@@ -185,12 +314,13 @@ class Scheduler:
         :return: A :class:`~datetime.datetime` object
                  or None if no jobs scheduled
         """
-        if not self.jobs:
-            return None
-        jobs_filtered = self.get_jobs(tag)
-        if not jobs_filtered:
-            return None
-        return min(jobs_filtered).next_run
+        with self._scheduler_lock:
+            if not self.jobs:
+                return None
+            jobs_filtered = self.get_jobs(tag)
+            if not jobs_filtered:
+                return None
+            return min(jobs_filtered).next_run
 
     next_run = property(get_next_run)
 
@@ -201,9 +331,17 @@ class Scheduler:
                  :meth:`next_run <Scheduler.next_run>`
                  or None if no jobs are scheduled
         """
-        if not self.next_run:
+        next_run = self.get_next_run()
+        if not next_run:
             return None
-        return (self.next_run - datetime.datetime.now()).total_seconds()
+        return (next_run - datetime.datetime.now()).total_seconds()
+
+
+class ThreadSafeScheduler(Scheduler):
+    """Scheduler that prevents the same job from running in multiple threads."""
+
+    def __init__(self) -> None:
+        super().__init__(thread_safe=True)
 
 
 class Job:
@@ -253,6 +391,7 @@ class Job:
 
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional[Scheduler] = scheduler  # scheduler to register with
+        self._running = False
 
     def __lt__(self, other) -> bool:
         """
@@ -660,7 +799,8 @@ class Job:
                 "Unable to a add job to schedule. "
                 "Job is not associated with an scheduler"
             )
-        self.scheduler.jobs.append(self)
+        with self.scheduler._scheduler_lock:
+            self.scheduler.jobs.append(self)
         return self
 
     @property
@@ -680,9 +820,18 @@ class Job:
         case CancelJob takes priority over any other returned value.
 
         :return: The return value returned by the `job_func`, or CancelJob if the job's
-                 deadline is reached.
+                 deadline is reached. On a thread-safe scheduler this returns
+                 ``None`` without running when the job is already running.
 
         """
+        if self.scheduler is not None and self.scheduler._thread_safe:
+            return self.scheduler._run_job(
+                self, force=True, scheduled=False
+            )
+        return self._run()
+
+    def _run(self):
+        """Run and reschedule this job without scheduler-level claiming."""
         if self._is_overdue(datetime.datetime.now()):
             logger.debug("Cancelling job %s", self)
             return CancelJob

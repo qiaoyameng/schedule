@@ -2,6 +2,7 @@
 
 import datetime
 import functools
+import threading
 from unittest import mock, TestCase
 import os
 import time
@@ -1597,3 +1598,209 @@ class SchedulerTests(TestCase):
         scheduler.every()
         scheduler.every(10).seconds
         scheduler.run_pending()
+
+    def test_thread_safe_run_pending_claims_job_once_and_keeps_reschedule(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        barrier = threading.Barrier(2)
+        release_job = threading.Event()
+        entered_job = threading.Event()
+        call_count = 0
+        rescheduled_to = datetime.datetime(2100, 1, 1)
+
+        def rescheduling_job():
+            nonlocal call_count
+            call_count += 1
+            entered_job.set()
+            release_job.wait(1)
+            job.next_run = rescheduled_to
+
+        job = scheduler.every().second.do(rescheduling_job)
+        job.next_run = datetime.datetime.now() - datetime.timedelta(seconds=1)
+
+        def poll():
+            barrier.wait()
+            scheduler.run_pending()
+
+        threads = [threading.Thread(target=poll) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+
+        assert entered_job.wait(1)
+        release_job.set()
+        for thread in threads:
+            assert not thread.join(1)
+
+        assert call_count == 1
+        assert job.next_run == rescheduled_to
+
+        other_call_count = 0
+
+        def other_job():
+            nonlocal other_call_count
+            other_call_count += 1
+
+        other_job_instance = scheduler.every().second.do(other_job)
+        other_job_instance.next_run = (
+            datetime.datetime.now() - datetime.timedelta(seconds=1)
+        )
+        scheduler.run_pending()
+
+        assert other_call_count == 1
+        assert job.next_run == rescheduled_to
+
+    def test_thread_safe_job_releases_claim_after_failure(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        call_count = 0
+
+        def sometimes_failing_job():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("job failed")
+
+        job = scheduler.every().second.do(sometimes_failing_job)
+        job.next_run = datetime.datetime.now() - datetime.timedelta(seconds=1)
+
+        with self.assertRaises(RuntimeError):
+            scheduler.run_pending()
+        assert job._running is False
+
+        scheduler.run_pending()
+        assert call_count == 2
+        assert job._running is False
+
+    def test_thread_safe_failure_releases_unstarted_claims(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        successful_call_count = 0
+
+        def failing_job():
+            raise RuntimeError("job failed")
+
+        def successful_job():
+            nonlocal successful_call_count
+            successful_call_count += 1
+
+        failing_job_instance = scheduler.every().second.do(failing_job)
+        failing_job_instance.next_run = datetime.datetime.now() - (
+            datetime.timedelta(seconds=2)
+        )
+        successful_job_instance = scheduler.every().second.do(successful_job)
+        successful_job_instance.next_run = datetime.datetime.now() - (
+            datetime.timedelta(seconds=1)
+        )
+
+        with self.assertRaises(RuntimeError):
+            scheduler.run_pending()
+
+        assert failing_job_instance._running is False
+        assert successful_job_instance._running is False
+
+        failing_job_instance.next_run = datetime.datetime(2100, 1, 1)
+        successful_job_instance.next_run = datetime.datetime.now() - (
+            datetime.timedelta(seconds=1)
+        )
+        scheduler.run_pending()
+        assert successful_call_count == 1
+        assert successful_job_instance._running is False
+
+    def test_thread_safe_run_pending_runs_each_claimed_job_once(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        call_counts = []
+
+        for offset_seconds in (2, 1):
+            def counted_job():
+                call_counts.append(1)
+
+            job = scheduler.every().second.do(counted_job)
+            due_at = datetime.datetime.now()
+            job.next_run = due_at - datetime.timedelta(seconds=offset_seconds)
+
+        scheduler.run_pending()
+
+        assert len(call_counts) == 2
+
+    def test_thread_safe_job_run_uses_scheduler_claim(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        call_count = 0
+
+        def mock_job():
+            nonlocal call_count
+            call_count += 1
+            return "result"
+
+        job = scheduler.every().second.do(mock_job)
+        previous_next_run = job.next_run
+
+        assert job.run() == "result"
+        assert call_count == 1
+        assert job.next_run > previous_next_run
+
+        job._running = True
+        assert job.run() is None
+        assert call_count == 1
+        job._running = False
+
+    def test_thread_safe_run_all_skips_already_running_job(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        current_job_count = 0
+        other_job_count = 0
+
+        def current_job():
+            nonlocal current_job_count
+            current_job_count += 1
+            scheduler.run_all()
+
+        def other_job():
+            nonlocal other_job_count
+            other_job_count += 1
+
+        scheduler.every().second.do(current_job)
+        scheduler.every().second.do(other_job)
+        scheduler.run_all()
+
+        assert current_job_count == 1
+        assert other_job_count == 1
+
+    def test_thread_safe_callback_can_cancel_add_and_reschedule_jobs(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        added_job_count = 0
+
+        def added_job():
+            nonlocal added_job_count
+            added_job_count += 1
+
+        def canceling_job():
+            return schedule.CancelJob
+
+        canceling_job_instance = scheduler.every().second.do(canceling_job)
+        canceling_job_instance.next_run = (
+            datetime.datetime.now() - datetime.timedelta(seconds=1)
+        )
+
+        def rescheduling_job():
+            scheduler.every().second.do(added_job)
+            rescheduling_job_instance.next_run = datetime.datetime(2100, 1, 1)
+
+        rescheduling_job_instance = scheduler.every().second.do(
+            rescheduling_job
+        )
+        rescheduling_job_instance.next_run = (
+            datetime.datetime.now() - datetime.timedelta(seconds=1)
+        )
+
+        scheduler.run_pending()
+
+        added_job_instance = scheduler.jobs[-1]
+        added_job_instance.next_run = (
+            datetime.datetime.now() - datetime.timedelta(seconds=1)
+        )
+        rescheduling_job_instance.next_run = datetime.datetime(2100, 1, 1)
+        assert canceling_job_instance not in scheduler.jobs
+        assert rescheduling_job_instance.next_run == datetime.datetime(
+            2100, 1, 1
+        )
+        scheduler.run_pending()
+        assert added_job_count == 1
+        assert rescheduling_job_instance.next_run == datetime.datetime(
+            2100, 1, 1
+        )
