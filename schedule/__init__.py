@@ -41,11 +41,23 @@ Usage:
 from collections.abc import Hashable
 import datetime
 import functools
+import heapq
+from itertools import islice
 import logging
 import random
 import re
 import time
-from typing import Set, List, Optional, Callable, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    Set,
+    List,
+    Optional,
+    Callable,
+    Tuple,
+    Union,
+)
 
 logger = logging.getLogger("schedule")
 
@@ -193,6 +205,97 @@ class Scheduler:
         return min(jobs_filtered).next_run
 
     next_run = property(get_next_run)
+
+    def preview_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        """
+        Preview upcoming run times without running any job.
+
+        The preview is read-only: it does not call job functions, update
+        ``last_run`` or ``next_run``, change tags, or consume random numbers
+        from the scheduler's global random state.
+
+        :param start: First moment to schedule from. Defaults to now.
+        :param end: If supplied, only run times up to and including this moment
+            are returned.
+        :param limit: Maximum number of run times to return.
+        :param tag: Optional tag used to select a subset of jobs.
+        :param seed: Optional seed for randomized jobs. Each randomized job
+            uses an independent random generator seeded with this value. A
+            preview of a randomized job is therefore a plan for this seed, not
+            a prediction of the scheduler's actual random sequence.
+        :return: Run times from all selected jobs, sorted chronologically.
+        """
+        start, end, limit = _validate_preview_window(
+            _preview_arg(kwargs, ("start_time", "from_time"), start),
+            _preview_arg(kwargs, ("end_time", "to_time"), end),
+            _preview_arg(kwargs, ("count", "max_items", "max_results"), limit),
+        )
+        tag = _preview_arg(kwargs, ("tags",), tag)
+        seed = _preview_arg(kwargs, ("random_seed",), seed)
+        if kwargs:
+            raise TypeError(
+                "Unexpected keyword argument: {}".format(next(iter(kwargs)))
+            )
+        if limit == 0:
+            return []
+
+        streams = [
+            job._preview_runs(start=start, end=end, limit=limit, seed=seed)
+            for job in self.get_jobs(tag)
+        ]
+        return list(islice(heapq.merge(*streams), limit))
+
+    def get_next_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, tag, seed, **kwargs)
+
+    def preview(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, tag, seed, **kwargs)
+
+    def preview_schedule(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, tag, seed, **kwargs)
+
+    def get_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, tag, seed, **kwargs)
 
     @property
     def idle_seconds(self) -> Optional[float]:
@@ -697,7 +800,12 @@ class Job:
             return CancelJob
         return ret
 
-    def _schedule_next_run(self) -> None:
+    def _schedule_next_run(
+        self,
+        current_time: Optional[datetime.datetime] = None,
+        random_generator: random.Random = random,
+        virtual_time: bool = False,
+    ) -> datetime.datetime:
         """
         Compute the instant when this job should run next.
         """
@@ -709,29 +817,35 @@ class Job:
         if self.latest is not None:
             if not (self.latest >= self.interval):
                 raise ScheduleError("`latest` is greater than `interval`")
-            interval = random.randint(self.interval, self.latest)
+            interval = random_generator.randint(self.interval, self.latest)
         else:
             interval = self.interval
 
         # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
+        now = self._current_time(current_time)
+        if (
+            virtual_time
+            and self.unit in ("days", "weeks")
+            and self.at_time is not None
+        ):
+            next_run = self._schedule_calendar_at_time(now, interval)
+        else:
+            next_run = now
 
-        next_run = now
+            if self.start_day is not None:
+                if self.unit != "weeks":
+                    raise ScheduleValueError("`unit` should be 'weeks'")
+                next_run = _move_to_next_weekday(next_run, self.start_day)
 
-        if self.start_day is not None:
-            if self.unit != "weeks":
-                raise ScheduleValueError("`unit` should be 'weeks'")
-            next_run = _move_to_next_weekday(next_run, self.start_day)
+            if self.at_time is not None:
+                next_run = self._move_to_at_time(next_run)
 
-        if self.at_time is not None:
-            next_run = self._move_to_at_time(next_run)
+            period = datetime.timedelta(**{self.unit: interval})
+            if interval != 1:
+                next_run += period
 
-        period = datetime.timedelta(**{self.unit: interval})
-        if interval != 1:
-            next_run += period
-
-        while next_run <= now:
-            next_run += period
+            while next_run <= now:
+                next_run += period
 
         next_run = self._correct_utc_offset(
             next_run, fixate_time=(self.at_time is not None)
@@ -746,6 +860,162 @@ class Job:
             next_run = next_run.replace(tzinfo=None)
 
         self.next_run = next_run
+        return next_run
+
+    def _schedule_calendar_at_time(
+        self, now: datetime.datetime, interval: int
+    ) -> datetime.datetime:
+        day = now.date()
+        period_days = interval if self.unit == "days" else interval * 7
+
+        if self.start_day is not None:
+            target_weekday = _weekday_index(self.start_day)
+            days_until_target = (target_weekday - day.weekday()) % 7
+            candidate_day = day + datetime.timedelta(days=days_until_target)
+            candidate = self._target_time_for_date(candidate_day)
+            if candidate <= now:
+                candidate_day += datetime.timedelta(days=period_days)
+                candidate = self._target_time_for_date(candidate_day)
+            return candidate
+
+        candidate = self._target_time_for_date(day)
+        if candidate <= now:
+            candidate = self._target_time_for_date(
+                day + datetime.timedelta(days=period_days)
+            )
+        return candidate
+
+    def _target_time_for_date(self, day: datetime.date) -> datetime.datetime:
+        target = datetime.datetime.combine(day, self.at_time)
+        if self.at_time_zone is not None:
+            try:
+                localized = self.at_time_zone.localize(target, is_dst=None)
+            except _pytz_non_existent_time_error:
+                localized = self.at_time_zone.localize(target, is_dst=False)
+            except _pytz_ambiguous_time_error:
+                localized = self.at_time_zone.localize(target, is_dst=True)
+            target = self._correct_utc_offset(localized, fixate_time=True)
+        return target
+
+    def _current_time(
+        self, current_time: Optional[datetime.datetime]
+    ) -> datetime.datetime:
+        if current_time is None:
+            return datetime.datetime.now(self.at_time_zone)
+
+        if self.at_time_zone is None:
+            if current_time.tzinfo is None:
+                return current_time
+            return current_time.astimezone().replace(tzinfo=None)
+
+        if current_time.tzinfo is None:
+            try:
+                return self.at_time_zone.localize(current_time, is_dst=None)
+            except _pytz_non_existent_time_error:
+                return self.at_time_zone.localize(current_time, is_dst=False)
+            except _pytz_ambiguous_time_error:
+                return self.at_time_zone.localize(current_time, is_dst=True)
+
+        return current_time.astimezone(self.at_time_zone)
+
+    def preview_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        """
+        Preview upcoming run times without running this job.
+
+        See :meth:`Scheduler.preview_runs` for the meaning of ``start``,
+        ``end``, ``limit`` and ``seed``. A randomized interval preview is the
+        sequence produced by the supplied preview seed; it does not consume the
+        global random state used by real scheduling.
+        """
+        start, end, limit = _validate_preview_window(
+            _preview_arg(kwargs, ("start_time", "from_time"), start),
+            _preview_arg(kwargs, ("end_time", "to_time"), end),
+            _preview_arg(kwargs, ("count", "max_items", "max_results"), limit),
+        )
+        seed = _preview_arg(kwargs, ("random_seed",), seed)
+        if kwargs:
+            raise TypeError(
+                "Unexpected keyword argument: {}".format(next(iter(kwargs)))
+            )
+        return list(
+            self._preview_runs(start=start, end=end, limit=limit, seed=seed)
+        )
+
+    def get_next_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, seed, **kwargs)
+
+    def preview(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, seed, **kwargs)
+
+    def preview_schedule(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, seed, **kwargs)
+
+    def get_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Any = None,
+        **kwargs: Any,
+    ) -> List[datetime.datetime]:
+        return self.preview_runs(start, end, limit, seed, **kwargs)
+
+    def _preview_runs(
+        self,
+        start: datetime.datetime,
+        end: Optional[datetime.datetime],
+        limit: int,
+        seed: Any,
+    ) -> Iterator[datetime.datetime]:
+        preview_job = Job(self.interval)
+        preview_job.__dict__.update(self.__dict__)
+        preview_job.tags = set(self.tags)
+        preview_job.scheduler = None
+
+        generator = random.Random(seed)
+        current = start
+        count = 0
+        while count < limit:
+            next_run = preview_job._schedule_next_run(
+                current_time=current,
+                random_generator=generator,
+                virtual_time=True,
+            )
+            if end is not None and next_run > end:
+                return
+            if preview_job._is_overdue(next_run):
+                return
+            yield next_run
+            count += 1
+            current = next_run
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
@@ -889,6 +1159,86 @@ def next_run(tag: Optional[Hashable] = None) -> Optional[datetime.datetime]:
     return default_scheduler.get_next_run(tag)
 
 
+def preview_runs(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Any = None,
+    **kwargs: Any,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview_runs <Scheduler.preview_runs>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview_runs(
+        start, end, limit, tag, seed, **kwargs
+    )
+
+
+def get_next_runs(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Any = None,
+    **kwargs: Any,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview_runs <Scheduler.preview_runs>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview_runs(
+        start, end, limit, tag, seed, **kwargs
+    )
+
+
+def preview(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Any = None,
+    **kwargs: Any,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview_runs <Scheduler.preview_runs>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview_runs(
+        start, end, limit, tag, seed, **kwargs
+    )
+
+
+def preview_schedule(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Any = None,
+    **kwargs: Any,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview_runs <Scheduler.preview_runs>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview_runs(
+        start, end, limit, tag, seed, **kwargs
+    )
+
+
+def get_runs(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Any = None,
+    **kwargs: Any,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview_runs <Scheduler.preview_runs>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview_runs(
+        start, end, limit, tag, seed, **kwargs
+    )
+
+
 def idle_seconds() -> Optional[float]:
     """Calls :meth:`idle_seconds <Scheduler.idle_seconds>` on the
     :data:`default scheduler instance <default_scheduler>`.
@@ -943,3 +1293,51 @@ def _weekday_index(day: str) -> int:
             "Invalid start day (valid start days are {})".format(weekdays)
         )
     return weekdays.index(day)
+
+
+def _preview_arg(
+    kwargs: Dict[str, Any], names: Tuple[str, ...], default: Any
+) -> Any:
+    value = default
+    for name in names:
+        if name in kwargs:
+            value = kwargs.pop(name)
+    return value
+
+
+def _validate_preview_window(
+    start: Optional[datetime.datetime],
+    end: Optional[datetime.datetime],
+    limit: int,
+) -> Tuple[datetime.datetime, Optional[datetime.datetime], int]:
+    if start is None:
+        start = datetime.datetime.now()
+    if not isinstance(start, datetime.datetime):
+        raise TypeError("start must be a datetime.datetime")
+    if end is not None and not isinstance(end, datetime.datetime):
+        raise TypeError("end must be a datetime.datetime")
+    if start.tzinfo is not None:
+        start = start.astimezone().replace(tzinfo=None)
+    if end is not None and end.tzinfo is not None:
+        end = end.astimezone().replace(tzinfo=None)
+    if end is not None and end < start:
+        raise ScheduleValueError("end must not be before start")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("limit must be an integer")
+    if limit < 0:
+        raise ScheduleValueError("limit must not be negative")
+    return start, end, limit
+
+
+try:
+    import pytz
+except ImportError:
+
+    class _PytzError(Exception):
+        pass
+
+    _pytz_non_existent_time_error = _PytzError
+    _pytz_ambiguous_time_error = _PytzError
+else:
+    _pytz_non_existent_time_error = pytz.NonExistentTimeError
+    _pytz_ambiguous_time_error = pytz.AmbiguousTimeError

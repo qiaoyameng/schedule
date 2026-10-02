@@ -44,6 +44,10 @@ Usage
     schedule.every().day.at("12:42", "Europe/Amsterdam").do(job)
     schedule.every().minute.at(":17").do(job)
 
+    # Inspect a read-only plan. Randomized intervals use their own preview seed,
+    # so this neither runs jobs nor consumes scheduler random state.
+    schedule.preview_runs(limit=10, seed=42)
+
     def job_with_argument(name):
         print(f"I am {name}")
 

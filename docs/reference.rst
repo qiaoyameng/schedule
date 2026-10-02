@@ -18,6 +18,9 @@ Main Interface
 .. autofunction:: clear
 .. autofunction:: cancel_job
 .. autofunction:: next_run
+.. autofunction:: preview_runs
+.. autofunction:: get_next_runs
+.. autofunction:: preview
 .. autofunction:: idle_seconds
 
 

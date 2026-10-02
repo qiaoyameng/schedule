@@ -2,6 +2,7 @@
 
 import datetime
 import functools
+import random
 from unittest import mock, TestCase
 import os
 import time
@@ -232,6 +233,144 @@ class SchedulerTests(TestCase):
             assert schedule.default_scheduler.get_next_run("tag2") == job3.next_run
             assert schedule.next_run("tag3") == job3.next_run
             assert schedule.next_run("tag4") is None
+
+    def test_preview_runs_range_and_limit(self):
+        with mock_datetime(2014, 6, 28, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            mock_job = make_mock_job()
+            scheduler.every(10).seconds.do(mock_job)
+            scheduler.every(15).seconds.do(mock_job)
+
+            now = datetime.datetime.now()
+            assert scheduler.preview_runs(
+                start=now,
+                end=now + datetime.timedelta(seconds=30),
+                limit=5,
+            ) == [
+                now + datetime.timedelta(seconds=10),
+                now + datetime.timedelta(seconds=15),
+                now + datetime.timedelta(seconds=20),
+                now + datetime.timedelta(seconds=30),
+                now + datetime.timedelta(seconds=30),
+            ]
+
+    def test_preview_runs_is_read_only(self):
+        with mock_datetime(2014, 6, 28, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            mock_job = make_mock_job()
+            job = scheduler.every(5).seconds.do(mock_job).tag("preview")
+            now = datetime.datetime.now()
+            tags = set(job.tags)
+            next_run = job.next_run
+            random_state = random.getstate()
+
+            preview = scheduler.preview_runs(
+                start=now,
+                end=now + datetime.timedelta(seconds=20),
+                limit=2,
+                tag="preview",
+            )
+
+            assert preview == [
+                now + datetime.timedelta(seconds=5),
+                now + datetime.timedelta(seconds=10),
+            ]
+            assert mock_job.call_count == 0
+            assert job.last_run is None
+            assert job.next_run == next_run
+            assert job.tags == tags
+            assert len(scheduler.jobs) == 1
+            assert random.getstate() == random_state
+
+    def test_preview_random_runs_uses_explicit_seed(self):
+        with mock_datetime(2014, 6, 28, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            job = scheduler.every(2).to(5).seconds.do(make_mock_job())
+            now = datetime.datetime.now()
+            random.seed("scheduler-state")
+            random_state = random.getstate()
+
+            first_preview = job.preview_runs(limit=5, seed="preview-seed")
+            second_preview = job.preview_runs(limit=5, seed="preview-seed")
+
+            assert first_preview == second_preview
+            assert random.getstate() == random_state
+
+            rng = random.Random("preview-seed")
+            intervals = [rng.randint(2, 5) for _ in range(5)]
+            expected = [
+                now + datetime.timedelta(seconds=sum(intervals[: index + 1]))
+                for index in range(5)
+            ]
+            assert first_preview == expected
+
+    def test_preview_until_terminates(self):
+        with mock_datetime(2014, 6, 28, 12, 0, 0):
+            now = datetime.datetime.now()
+            scheduler = schedule.Scheduler()
+            job = (
+                scheduler.every(5)
+                .seconds.until(now + datetime.timedelta(seconds=12))
+                .do(make_mock_job())
+            )
+
+            assert job.preview_runs(start=now, limit=10, seed=1) == [
+                now + datetime.timedelta(seconds=5),
+                now + datetime.timedelta(seconds=10),
+            ]
+
+            expired_start = now + datetime.timedelta(seconds=20)
+            assert job.preview_runs(start=expired_start, limit=10, seed=1) == []
+
+    def test_preview_daily_dst(self):
+        try:
+            import pytz
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+            return
+
+        with mock_datetime(2023, 3, 26, 1, 30, 0):
+            scheduler = schedule.Scheduler()
+            job = (
+                scheduler.every()
+                .day.at("02:30", "Europe/Berlin")
+                .do(make_mock_job())
+            )
+
+            assert job.preview_runs(limit=2, seed=1) == [
+                datetime.datetime(2023, 3, 26, 3, 30),
+                datetime.datetime(2023, 3, 27, 2, 30),
+            ]
+
+    def test_preview_does_not_change_scheduler_results(self):
+        with mock_datetime(2014, 6, 28, 12, 0, 0):
+            control = schedule.Scheduler()
+            previewed = schedule.Scheduler()
+            control_job_function = make_mock_job("control")
+            previewed_job_function = make_mock_job("previewed")
+
+            random.seed(11)
+            control_job = control.every(2).to(5).seconds.do(control_job_function)
+            random.seed(11)
+            previewed_job = previewed.every(2).to(5).seconds.do(
+                previewed_job_function
+            )
+
+            assert control_job.next_run == previewed_job.next_run
+            previewed.preview_runs(limit=10, seed=99)
+            assert control_job.next_run == previewed_job.next_run
+
+            shared_state = random.getstate()
+            with mock_datetime(2014, 6, 28, 12, 1, 0):
+                control.run_pending()
+                control_next_run = control_job.next_run
+
+                random.setstate(shared_state)
+                previewed.run_pending()
+
+            assert control_job_function.call_count == 1
+            assert previewed_job_function.call_count == 1
+            assert control_job.next_run == previewed_job.next_run == control_next_run
 
     def test_singular_time_units_match_plural_units(self):
         assert every().second.unit == every().seconds.unit
