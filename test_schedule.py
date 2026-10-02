@@ -1597,3 +1597,214 @@ class SchedulerTests(TestCase):
         scheduler.every()
         scheduler.every(10).seconds
         scheduler.run_pending()
+
+
+class CalendarConstraintTests(TestCase):
+    """
+    Tests for the combined calendar constraints on_weekdays(),
+    except_dates() and between() on daily and weekly jobs.
+    """
+
+    def setUp(self):
+        schedule.clear()
+
+    def test_weekday_sync_with_maintenance_calendar_over_dst_switch(self):
+        """
+        Weekday early-morning sync that must skip a maintenance calendar,
+        simulated across the 2021-03-28 02:00 -> 03:00 Europe/Berlin DST
+        switch. Every computed run must satisfy the final local weekday,
+        date and window constraints.
+        """
+        try:
+            import pytz  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+
+        maintenance = {datetime.date(2021, 3, 29), datetime.date(2021, 3, 31)}
+        with mock_datetime(2021, 3, 26, 12, 0, 0):
+            job = (
+                every()
+                .day.at("02:30", "Europe/Berlin")
+                .on_weekdays("monday", "tuesday", "wednesday", "thursday", "friday")
+                .except_dates(*sorted(maintenance))
+                .between("01:00", "04:00")
+                .do(make_mock_job())
+            )
+
+        expected_runs = [
+            # Sat 27/Sun 28 skipped (weekend), Mon 29 is a maintenance day
+            datetime.datetime(2021, 3, 30, 2, 30),
+            # Wed 31 is a maintenance day
+            datetime.datetime(2021, 4, 1, 2, 30),
+            datetime.datetime(2021, 4, 2, 2, 30),
+            # Sat 3/Sun 4 skipped (weekend)
+            datetime.datetime(2021, 4, 5, 2, 30),
+            datetime.datetime(2021, 4, 6, 2, 30),
+        ]
+        for expected in expected_runs:
+            assert job.next_run == expected
+            # verify the final local date and window conditions
+            assert job.next_run.weekday() < 5
+            assert job.next_run.date() not in maintenance
+            assert datetime.time(1, 0) <= job.next_run.time() <= datetime.time(4, 0)
+            moment_after = expected + datetime.timedelta(minutes=1)
+            with mock_datetime(
+                moment_after.year,
+                moment_after.month,
+                moment_after.day,
+                moment_after.hour,
+                moment_after.minute,
+            ):
+                job.run()
+
+    def test_dst_gap_moves_run_forward_within_window(self):
+        """
+        2021-03-28 02:30 does not exist in Europe/Berlin (clock jumps
+        02:00 -> 03:00). The run moves forward by the gap to 03:30,
+        which stays inside the 01:00-04:00 window.
+        """
+        try:
+            import pytz  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+
+        with mock_datetime(2021, 3, 27, 12, 0, 0):
+            job = (
+                every()
+                .day.at("02:30", "Europe/Berlin")
+                .between("01:00", "04:00")
+                .do(make_mock_job())
+            )
+        assert job.next_run == datetime.datetime(2021, 3, 28, 3, 30)
+
+    def test_dst_gap_landing_on_excluded_date_is_skipped(self):
+        """
+        Pacific/Apia skipped 2011-12-30 entirely (dateline change). The
+        10:00 run shifts forward by the 24h gap onto 2011-12-31, which is
+        an excluded date, so the run must move on to 2012-01-01 instead of
+        falling back onto an excluded day after timezone conversion.
+        """
+        try:
+            import pytz
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+
+        excluded = datetime.date(2011, 12, 31)
+        # 2011-12-29 22:00 Berlin == 2011-12-29 11:00 in Apia (UTC-10)
+        with mock_datetime(2011, 12, 29, 22, 0, 0):
+            job = (
+                every()
+                .day.at("10:00", "Pacific/Apia")
+                .except_dates(excluded)
+                .do(make_mock_job())
+            )
+        # 2012-01-01 10:00 +14:00 == 2011-12-31 20:00 UTC == 21:00 Berlin
+        assert job.next_run == datetime.datetime(2011, 12, 31, 21, 0)
+        # the final local date in the job's timezone is not excluded
+        apia = pytz.timezone("Pacific/Apia")
+        berlin = pytz.timezone("Europe/Berlin")
+        local_date = berlin.localize(job.next_run).astimezone(apia).date()
+        assert local_date == datetime.date(2012, 1, 1)
+        assert local_date != excluded
+
+    def test_dst_overlap_picks_earlier_occurrence(self):
+        """
+        2021-11-07 01:30 occurs twice in America/New_York (fall back).
+        The earlier occurrence (EDT, UTC-4) is chosen: 05:30 UTC, which
+        is 06:30 in Europe/Berlin local time.
+        """
+        try:
+            import pytz  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+
+        with mock_datetime(2021, 11, 6, 12, 0, 0):
+            job = (
+                every()
+                .day.at("01:30", "America/New_York")
+                .between("00:00", "06:00")
+                .do(make_mock_job())
+            )
+        assert job.next_run == datetime.datetime(2021, 11, 7, 6, 30)
+
+    def test_cross_midnight_window(self):
+        # no at() time: the job runs at the start of the window
+        with mock_datetime(2021, 3, 1, 12, 0, 0):
+            job = every().day.between("22:00", "02:00").do(make_mock_job())
+            assert job.next_run == datetime.datetime(2021, 3, 1, 22, 0)
+
+        # at() times on both sides of midnight are inside the window
+        with mock_datetime(2021, 3, 1, 12, 0, 0):
+            job = every().day.at("01:30").between("22:00", "02:00").do(make_mock_job())
+            assert job.next_run == datetime.datetime(2021, 3, 2, 1, 30)
+
+        with mock_datetime(2021, 3, 1, 12, 0, 0):
+            job = every().day.at("23:00").between("22:00", "02:00").do(make_mock_job())
+            assert job.next_run == datetime.datetime(2021, 3, 1, 23, 0)
+
+    def test_weekly_job_skips_excluded_date(self):
+        with mock_datetime(2021, 3, 26, 12, 0, 0):
+            job = (
+                every()
+                .monday.at("10:00")
+                .except_dates("2021-03-29")
+                .do(make_mock_job())
+            )
+            assert job.next_run == datetime.datetime(2021, 4, 5, 10, 0)
+
+    def test_except_dates_accepts_date_objects(self):
+        with mock_datetime(2021, 3, 1, 12, 0, 0):
+            job = (
+                every()
+                .day.at("10:00")
+                .except_dates(datetime.date(2021, 3, 2), datetime.datetime(2021, 3, 3))
+                .do(make_mock_job())
+            )
+            assert job.next_run == datetime.datetime(2021, 3, 4, 10, 0)
+
+    def test_on_weekdays_replaces_previous_setting(self):
+        with mock_datetime(2021, 3, 1, 12, 0, 0):  # a Monday
+            job = (
+                every()
+                .day.at("10:00")
+                .on_weekdays("monday")
+                .on_weekdays("tuesday")
+                .do(make_mock_job())
+            )
+            assert job.next_run == datetime.datetime(2021, 3, 2, 10, 0)
+
+    def test_constraint_configuration_errors(self):
+        # constraints are only supported for daily and weekly jobs
+        with self.assertRaises(ScheduleValueError):
+            every().hour.on_weekdays("monday").do(make_mock_job())
+        # constraints require an interval of 1
+        with self.assertRaises(ScheduleValueError):
+            every(2).days.on_weekdays("monday").do(make_mock_job())
+        # constraints cannot be combined with randomized intervals
+        with self.assertRaises(ScheduleValueError):
+            every().to(3).days.between("01:00", "02:00").do(make_mock_job())
+        # weekly jobs need a fixed weekday (e.g. every().monday)
+        with self.assertRaises(ScheduleValueError):
+            every().week.between("01:00", "02:00").do(make_mock_job())
+        # weekday constraints leaving no allowed weekday are unsatisfiable
+        with self.assertRaises(ScheduleValueError):
+            every().tuesday.on_weekdays("monday").do(make_mock_job())
+        # an at() time outside the window is unsatisfiable
+        with self.assertRaises(ScheduleValueError):
+            every().day.at("10:00").between("22:00", "23:00").do(make_mock_job())
+
+    def test_constraint_validation_errors(self):
+        with self.assertRaises(ScheduleValueError):
+            every().day.on_weekdays()
+        with self.assertRaises(ScheduleValueError):
+            every().day.on_weekdays("funday")
+        with self.assertRaises(ScheduleValueError):
+            every().day.between("10:00", "10:00")
+        with self.assertRaises(ScheduleValueError):
+            every().day.between("25:00", "26:00")
+        with self.assertRaises(ScheduleValueError):
+            every().day.except_dates("31-12-2021")
+        with self.assertRaises(TypeError):
+            every().day.except_dates(20211231)
+        with self.assertRaises(TypeError):
+            every().day.between(10, 12)

@@ -251,6 +251,18 @@ class Job:
         # optional time of final run
         self.cancel_after: Optional[datetime.datetime] = None
 
+        # Optional calendar constraints for daily and weekly jobs:
+        # - allowed_weekdays: set of weekday indices (0=Monday .. 6=Sunday)
+        #   on which the job may run. None means no restriction.
+        # - excluded_dates: set of local dates (e.g. a maintenance calendar)
+        #   on which the job must not run. Interpreted in the job's timezone.
+        # - window_start/window_end: local time-of-day window within which
+        #   the job may run. The window may cross midnight.
+        self.allowed_weekdays: Optional[Set[int]] = None
+        self.excluded_dates: Set[datetime.date] = set()
+        self.window_start: Optional[datetime.time] = None
+        self.window_end: Optional[datetime.time] = None
+
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional[Scheduler] = scheduler  # scheduler to register with
 
@@ -558,6 +570,135 @@ class Job:
         self.at_time = datetime.time(hour, minute, second)
         return self
 
+    def on_weekdays(self, *weekdays: str):
+        """
+        Restrict the days of the week on which this job may run.
+
+        Only supported for daily and weekly jobs. For a weekly job the
+        allowed weekdays are intersected with the job's weekday (e.g.
+        ``every().monday``); if nothing remains, the constraints are
+        unsatisfiable and :class:`ScheduleValueError` is raised when the
+        job is scheduled.
+
+        Cannot be combined with randomized intervals (see :meth:`to`) or
+        with an interval greater than 1.
+
+        :param weekdays: One or more weekday names, e.g.
+            ``"monday"``, ``"tuesday"``. Calling this method again
+            replaces the previously configured weekdays.
+        :return: The invoked job instance
+        """
+        if not weekdays:
+            raise ScheduleValueError("on_weekdays() requires at least one weekday")
+        # _weekday_index raises ScheduleValueError on invalid names
+        self.allowed_weekdays = {_weekday_index(day) for day in weekdays}
+        return self
+
+    def except_dates(self, *dates: Union[datetime.date, str]):
+        """
+        Exclude specific local dates on which this job must not run,
+        e.g. a maintenance calendar.
+
+        Dates are interpreted in the job's timezone (the ``tz`` argument
+        of :meth:`at`), or in local time when no timezone is configured.
+        If a DST transition moves a run onto an excluded date, that date
+        is skipped as well.
+
+        Only supported for daily and weekly jobs and cannot be combined
+        with randomized intervals (see :meth:`to`).
+
+        :param dates: One or more dates, each either a
+            ``datetime.date``, a ``datetime.datetime`` (its date
+            component is used) or a string in ``YYYY-MM-DD`` format.
+        :return: The invoked job instance
+        """
+        for date in dates:
+            self.excluded_dates.add(self._coerce_date(date))
+        return self
+
+    def between(self, start: str, end: str):
+        """
+        Restrict runs to a local time-of-day window, e.g.
+        ``between("22:00", "02:00")``.
+
+        The window may cross midnight: when `start` is later than `end`,
+        times from `start` until midnight and from midnight until `end`
+        are allowed. Both boundaries are inclusive.
+
+        If :meth:`at` is configured, its time must lie within the window
+        or the constraints are unsatisfiable and
+        :class:`ScheduleValueError` is raised when the job is scheduled.
+        If no :meth:`at` time is configured, the job runs at the start
+        of the window.
+
+        Only supported for daily and weekly jobs and cannot be combined
+        with randomized intervals (see :meth:`to`).
+
+        :param start: Window start as ``HH:MM`` or ``HH:MM:SS``
+        :param end: Window end as ``HH:MM`` or ``HH:MM:SS``
+        :return: The invoked job instance
+        """
+        self.window_start = self._parse_window_time(start, "start")
+        self.window_end = self._parse_window_time(end, "end")
+        if self.window_start == self.window_end:
+            raise ScheduleValueError("between() start and end must not be equal")
+        return self
+
+    @staticmethod
+    def _coerce_date(value: Union[datetime.date, str]) -> datetime.date:
+        if isinstance(value, datetime.datetime):
+            return value.date()
+        if isinstance(value, datetime.date):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+            except ValueError:
+                raise ScheduleValueError(
+                    "Invalid date format for except_dates() "
+                    "(valid format is YYYY-MM-DD)"
+                )
+        raise TypeError(
+            "except_dates() takes datetime.date, datetime.datetime or "
+            "YYYY-MM-DD string parameters"
+        )
+
+    @staticmethod
+    def _parse_window_time(value: str, name: str) -> datetime.time:
+        if not isinstance(value, str):
+            raise TypeError("between() %s time should be passed a string" % name)
+        if not re.match(r"^[0-2]\d:[0-5]\d(:[0-5]\d)?$", value):
+            raise ScheduleValueError(
+                "Invalid %s time format for between() "
+                "(valid format is HH:MM(:SS)?)" % name
+            )
+        parts = [int(part) for part in value.split(":")]
+        if len(parts) == 2:
+            parts.append(0)
+        hour, minute, second = parts
+        if not (0 <= hour <= 23):
+            raise ScheduleValueError(
+                "Invalid number of hours ({} is not between 0 and 23)".format(hour)
+            )
+        return datetime.time(hour, minute, second)
+
+    def _window_contains(self, moment: datetime.time) -> bool:
+        """
+        Test whether a time-of-day lies within the configured window.
+        Handles windows that cross midnight.
+        """
+        assert self.window_start is not None and self.window_end is not None
+        if self.window_start <= self.window_end:
+            return self.window_start <= moment <= self.window_end
+        return moment >= self.window_start or moment <= self.window_end
+
+    def _has_calendar_constraints(self) -> bool:
+        return (
+            self.allowed_weekdays is not None
+            or bool(self.excluded_dates)
+            or self.window_start is not None
+        )
+
     def to(self, latest: int):
         """
         Schedule the job to run at an irregular (randomized) interval.
@@ -566,6 +707,11 @@ class Job:
         to  `every` to `latest`. The range defined is inclusive on
         both ends. For example, `every(A).to(B).seconds` executes
         the job function every N seconds such that A <= N <= B.
+
+        Randomized intervals cannot be combined with the calendar
+        constraints :meth:`on_weekdays`, :meth:`except_dates` and
+        :meth:`between`; doing so raises :class:`ScheduleValueError`
+        when the job is scheduled.
 
         :param latest: Maximum interval between randomized job runs
         :return: The invoked job instance
@@ -701,6 +847,9 @@ class Job:
         """
         Compute the instant when this job should run next.
         """
+        if self._has_calendar_constraints():
+            self._schedule_next_run_constrained()
+            return
         if self.unit not in ("seconds", "minutes", "hours", "days", "weeks"):
             raise ScheduleValueError(
                 "Invalid unit (valid units are `seconds`, `minutes`, `hours`, "
@@ -746,6 +895,158 @@ class Job:
             next_run = next_run.replace(tzinfo=None)
 
         self.next_run = next_run
+
+    # Upper bound for the day-by-day search performed by
+    # _schedule_next_run_constrained. Excluded dates form a finite set and
+    # at least one weekday is allowed, so a solution always exists well
+    # within this bound unless the constraints are contradictory (which is
+    # detected up front). The bound only guards against pathological cases
+    # and keeps the search from looping (near-)forever.
+    _MAX_CONSTRAINT_SEARCH_DAYS = 4 * 366
+
+    def _schedule_next_run_constrained(self) -> None:
+        """
+        Compute the next run for a job with calendar constraints
+        (on_weekdays/except_dates/between).
+
+        The search advances day-by-day over the local calendar of the
+        job's timezone (never second-by-second), applies the weekday,
+        exclusion and window constraints to the *resolved* local moment
+        and raises promptly when the constraints are unsatisfiable.
+        """
+        if self.unit not in ("days", "weeks"):
+            raise ScheduleValueError(
+                "on_weekdays(), except_dates() and between() are only "
+                "supported for daily and weekly jobs"
+            )
+        if self.interval != 1:
+            raise ScheduleValueError(
+                "Calendar constraints are only supported with an interval "
+                "of 1 (every().day / every().week)"
+            )
+        if self.latest is not None:
+            raise ScheduleValueError(
+                "Randomized intervals (.to()) cannot be combined with "
+                "on_weekdays(), except_dates() or between()"
+            )
+        if self.unit == "weeks":
+            if self.start_day is None:
+                raise ScheduleValueError(
+                    "Calendar constraints on weekly jobs require a fixed "
+                    "weekday (e.g. every().monday)"
+                )
+            weekdays = {_weekday_index(self.start_day)}
+        else:
+            weekdays = set(range(7))
+        if self.allowed_weekdays is not None:
+            weekdays &= self.allowed_weekdays
+        if not weekdays:
+            raise ScheduleValueError(
+                "Constraints are unsatisfiable: no allowed weekday remains"
+            )
+        if (
+            self.at_time is not None
+            and self.window_start is not None
+            and not self._window_contains(self.at_time)
+        ):
+            raise ScheduleValueError(
+                "Constraints are unsatisfiable: the at() time lies outside "
+                "the between() window"
+            )
+
+        # Do all computation in the context of the requested timezone
+        now = datetime.datetime.now(self.at_time_zone)
+
+        if self.at_time is not None:
+            run_time = self.at_time
+        elif self.window_start is not None:
+            # No explicit at() time: run at the start of the window
+            run_time = self.window_start
+        else:
+            # No explicit time: keep the time-of-day of the current moment,
+            # mirroring the behavior of unconstrained daily jobs
+            run_time = now.time().replace(microsecond=0)
+
+        today = now.date()
+        candidate = None
+        for day_offset in range(self._MAX_CONSTRAINT_SEARCH_DAYS):
+            date = today + datetime.timedelta(days=day_offset)
+            if date.weekday() not in weekdays or date in self.excluded_dates:
+                continue
+            moment = self._resolve_local_time(date, run_time)
+            # Re-check the constraints on the *resolved* local moment:
+            # DST resolution may have moved it onto another local date
+            # (possibly an excluded one) or outside the window.
+            if moment.date().weekday() not in weekdays:
+                continue
+            if moment.date() in self.excluded_dates:
+                continue
+            if self.window_start is not None and not self._window_contains(
+                moment.time()
+            ):
+                continue
+            if moment <= now:
+                continue
+            candidate = moment
+            break
+        if candidate is None:
+            raise ScheduleError(
+                "Constraints are unsatisfiable: no run time matching the "
+                "constraints was found within %d days"
+                % self._MAX_CONSTRAINT_SEARCH_DAYS
+            )
+
+        # Keep the api consistent with older versions: store 'next_run' as
+        # a naive timestamp in the local timezone.
+        if self.at_time_zone is not None:
+            candidate = candidate.astimezone()
+            candidate = candidate.replace(tzinfo=None)
+
+        self.next_run = candidate
+
+    def _resolve_local_time(
+        self, date: datetime.date, at: datetime.time
+    ) -> datetime.datetime:
+        """
+        Combine a local date and time-of-day into a datetime in the job's
+        timezone, applying explicit DST policies:
+
+        - Nonexistent local times (spring-forward gap) are moved forward
+          by the size of the gap, keeping the minutes. For example, when
+          02:30 does not exist because the clock jumps from 02:00 to
+          03:00, the job is scheduled at 03:30.
+        - Ambiguous local times (fall-back overlap) resolve to the
+          earlier of the two occurrences.
+
+        The returned datetime is timezone-aware when the job has a
+        configured timezone, naive otherwise.
+        """
+        naive = datetime.datetime.combine(date, at)
+        tz = self.at_time_zone
+        if tz is None:
+            return naive
+        import pytz
+
+        try:
+            return tz.localize(naive, is_dst=None)
+        except pytz.exceptions.AmbiguousTimeError:
+            # Pick the earlier of the two occurrences (comparison of aware
+            # datetimes is by absolute instant).
+            return min(
+                tz.localize(naive, is_dst=True),
+                tz.localize(naive, is_dst=False),
+            )
+        except pytz.exceptions.NonExistentTimeError:
+            # Shift forward by the size of the gap, keeping HH:MM where
+            # possible (mirrors the policy of _correct_utc_offset).
+            offset_dst = tz.localize(naive, is_dst=True).utcoffset()
+            offset_std = tz.localize(naive, is_dst=False).utcoffset()
+            gap = abs(offset_dst - offset_std)
+            shifted = naive + gap
+            try:
+                return tz.localize(shifted, is_dst=None)
+            except pytz.exceptions.NonExistentTimeError:
+                return tz.normalize(tz.localize(shifted, is_dst=False))
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
