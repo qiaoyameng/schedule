@@ -2,6 +2,7 @@
 
 import datetime
 import functools
+import random
 from unittest import mock, TestCase
 import os
 import time
@@ -1597,3 +1598,152 @@ class SchedulerTests(TestCase):
         scheduler.every()
         scheduler.every(10).seconds
         scheduler.run_pending()
+
+
+class PreviewTests(TestCase):
+    def setUp(self):
+        schedule.clear()
+
+    def test_preview_fixed_interval(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            job = scheduler.every(10).minutes.do(make_mock_job())
+            runs = scheduler.preview(limit=10)
+            assert len(runs) == 10
+            assert runs[0] == job.next_run
+            for earlier, later in zip(runs, runs[1:]):
+                assert later - earlier == datetime.timedelta(minutes=10)
+
+    def test_preview_window_and_limit(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            scheduler.every(1).hours.do(make_mock_job())
+            start = datetime.datetime(2020, 1, 1, 12, 0, 0)
+            end = datetime.datetime(2020, 1, 2, 12, 0, 0)
+            runs = scheduler.preview(start=start, end=end, limit=100)
+            assert len(runs) == 24
+            assert all(start <= run <= end for run in runs)
+            # An inverted window or a non-positive limit yields no
+            # results instead of searching forever.
+            assert scheduler.preview(start=end, end=start) == []
+            assert scheduler.preview(limit=0) == []
+
+    def test_preview_is_read_only(self):
+        mock_job = make_mock_job()
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            job = scheduler.every(10).minutes.do(mock_job)
+            job.tag("keep")
+            next_run_before = job.next_run
+            runs = scheduler.preview(limit=5)
+            assert len(runs) == 5
+            assert mock_job.call_count == 0
+            assert job.last_run is None
+            assert job.next_run == next_run_before
+            assert job.tags == {"keep"}
+
+    def test_preview_does_not_consume_global_random_state(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            scheduler.every(1).to(10).seconds.do(make_mock_job())
+            random.seed(2024)
+            expected = [random.random() for _ in range(3)]
+            random.seed(2024)
+            scheduler.preview(limit=10, seed=5)
+            scheduler.preview(limit=10)
+            assert [random.random() for _ in range(3)] == expected
+
+    def test_preview_random_interval_with_seed(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            scheduler.every(5).to(10).minutes.do(make_mock_job())
+            first = scheduler.preview(limit=10, seed=42)
+            second = scheduler.preview(limit=10, seed=42)
+            assert first == second
+            assert len(first) == 10
+            deltas = [b - a for a, b in zip(first, first[1:])]
+            assert all(
+                datetime.timedelta(minutes=5) <= delta <= datetime.timedelta(minutes=10)
+                for delta in deltas
+            )
+
+    def test_preview_until(self):
+        mock_job = make_mock_job()
+        with mock_datetime(2020, 1, 1, 11, 35, 10):
+            scheduler = schedule.Scheduler()
+            scheduler.every(5).seconds.until(datetime.time(11, 35, 20)).do(mock_job)
+            runs = scheduler.preview(limit=100)
+            assert runs == [
+                datetime.datetime(2020, 1, 1, 11, 35, 15),
+                datetime.datetime(2020, 1, 1, 11, 35, 20),
+            ]
+            # Starting after the deadline yields no future runs
+            assert scheduler.preview(start=datetime.datetime(2020, 1, 1, 11, 36)) == []
+
+    def test_preview_expired_job(self):
+        mock_job = make_mock_job()
+        with mock_datetime(2020, 1, 1, 11, 35, 10):
+            scheduler = schedule.Scheduler()
+            # The first scheduled run is already past the deadline
+            scheduler.every().day.at("12:00").until(datetime.time(11, 40)).do(mock_job)
+            assert scheduler.preview(limit=10) == []
+
+    def test_preview_tag_filter(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler = schedule.Scheduler()
+            scheduler.every(1).hours.do(make_mock_job()).tag("hourly")
+            scheduler.every(1).minutes.do(make_mock_job()).tag("minutely")
+            runs = scheduler.preview(limit=5, tag="hourly")
+            assert len(runs) == 5
+            for earlier, later in zip(runs, runs[1:]):
+                assert later - earlier == datetime.timedelta(hours=1)
+
+    def test_preview_timezone(self):
+        try:
+            import pytz  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("pytz unavailable")
+        with mock_datetime(2023, 7, 15, 13, 0, 0, TZ_UTC):
+            scheduler = schedule.Scheduler()
+            job = scheduler.every().day.at("10:30", tz="Europe/Berlin").do(
+                make_mock_job()
+            )
+            runs = scheduler.preview(limit=3)
+            assert len(runs) == 3
+            assert runs[0] == job.next_run
+            assert runs[1] - runs[0] == datetime.timedelta(days=1)
+            assert runs[2] - runs[1] == datetime.timedelta(days=1)
+
+    def test_module_level_preview(self):
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            schedule.every().minute.do(make_mock_job())
+            runs = schedule.preview(limit=2)
+            assert len(runs) == 2
+
+    def test_preview_does_not_affect_real_schedule(self):
+        def make_scheduler():
+            mock_job = make_mock_job()
+            scheduler = schedule.Scheduler()
+            random.seed(1234)
+            job = scheduler.every(1).to(10).seconds.do(mock_job)
+            return scheduler, job, mock_job
+
+        with mock_datetime(2020, 1, 1, 12, 0, 0):
+            scheduler_a, job_a, mock_a = make_scheduler()
+            scheduler_b, job_b, mock_b = make_scheduler()
+            assert job_a.next_run == job_b.next_run
+
+            # Preview only scheduler A
+            previewed = scheduler_a.preview(limit=10, seed=7)
+            assert len(previewed) == 10
+
+            # Advance time and run both schedulers identically
+            with mock_datetime(2020, 1, 1, 12, 0, 30):
+                random.seed(999)
+                scheduler_a.run_pending()
+                random.seed(999)
+                scheduler_b.run_pending()
+
+            assert mock_a.call_count == mock_b.call_count
+            assert job_a.last_run == job_b.last_run
+            assert job_a.next_run == job_b.next_run

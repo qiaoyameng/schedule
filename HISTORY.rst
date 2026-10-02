@@ -3,6 +3,17 @@
 History
 -------
 
+Unreleased
+++++++++++
+
+- Add read-only schedule preview: ``Scheduler.preview()``, ``Job.preview_next_runs()``
+  and the module-level ``schedule.preview()`` return upcoming run times within a
+  start/end window, up to a configurable limit. Previews never call job functions,
+  never modify ``last_run``/``next_run``/tags and never consume the random state
+  used by the real schedule. Jobs with randomized intervals (``.to()``) accept an
+  explicit preview ``seed``; the preview shows the plan for that seed only.
+
+
 1.2.2 (2024-05-25)
 ++++++++++++++++++
 

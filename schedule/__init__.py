@@ -174,6 +174,48 @@ class Scheduler:
         if isinstance(ret, CancelJob) or ret is CancelJob:
             self.cancel_job(job)
 
+    def preview(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        tag: Optional[Hashable] = None,
+        seed: Optional[Hashable] = None,
+    ) -> List[datetime.datetime]:
+        """
+        Read-only preview of upcoming run times across jobs.
+
+        Returns up to `limit` scheduled run times within the
+        `[start, end]` window, sorted chronologically. Nothing is
+        executed or modified: job functions are never called, and
+        `last_run`, `next_run`, tags and the random state used by the
+        real schedule are all left untouched.
+
+        For jobs with a randomized interval (see :meth:`Job.to`) the
+        preview is computed with a private random generator seeded with
+        `seed`. The result is the plan for that particular seed only;
+        the real schedule draws its own random intervals and may differ.
+
+        Timezone, `until` and expiry semantics match the real scheduler.
+        If no future runs exist in the window, an empty list is returned.
+
+        :param start: Start of the preview window (naive local time,
+                      like :attr:`Job.next_run`). Defaults to now.
+        :param end: Optional end of the preview window.
+        :param limit: Maximum number of run times to return.
+        :param tag: Only preview jobs carrying this tag.
+        :param seed: Seed used to preview randomized-interval jobs.
+        :return: A sorted list of up to `limit` run times.
+        """
+        if start is None:
+            start = datetime.datetime.now()
+        rng = random.Random(seed)
+        moments: List[datetime.datetime] = []
+        for job in self.get_jobs(tag):
+            moments.extend(job._preview_next_runs(start, end, limit, rng))
+        moments.sort()
+        return moments[:limit]
+
     def get_next_run(
         self, tag: Optional[Hashable] = None
     ) -> Optional[datetime.datetime]:
@@ -697,24 +739,122 @@ class Job:
             return CancelJob
         return ret
 
+    def preview_next_runs(
+        self,
+        start: Optional[datetime.datetime] = None,
+        end: Optional[datetime.datetime] = None,
+        limit: int = 10,
+        seed: Optional[Hashable] = None,
+    ) -> List[datetime.datetime]:
+        """
+        Compute upcoming run times without changing the job in any way.
+
+        The preview is read-only: the job function is never called and
+        `last_run`, `next_run` and `tags` are left untouched. For jobs
+        scheduled with :meth:`to <Job.to>` (a randomized interval), the
+        intervals are drawn from a private random generator seeded with
+        `seed`, so the random state used by the real schedule is never
+        consumed. The result for such jobs is the plan for that
+        particular seed only; the real schedule draws its own random
+        intervals and may differ.
+
+        Timezone, `until` and expiry semantics match the real scheduler.
+        When no future runs exist (e.g. the job's deadline has passed),
+        an empty list is returned instead of searching forever.
+
+        :param start: Start of the preview window (naive local time,
+                      like :attr:`next_run`). Defaults to now.
+        :param end: Optional end of the preview window.
+        :param limit: Maximum number of run times to return.
+        :param seed: Seed for the private random generator used to
+                     preview jobs with a randomized interval.
+        :return: A list of up to `limit` scheduled run times.
+        """
+        rng = random.Random(seed)
+        return self._preview_next_runs(start, end, limit, rng)
+
+    def _preview_next_runs(
+        self,
+        start: Optional[datetime.datetime],
+        end: Optional[datetime.datetime],
+        limit: int,
+        rng: random.Random,
+    ) -> List[datetime.datetime]:
+        if limit <= 0 or self.next_run is None:
+            return []
+        if start is None:
+            start = datetime.datetime.now()
+        if end is not None and end < start:
+            return []
+
+        runs: List[datetime.datetime] = []
+        candidate = self.next_run
+        if candidate < start:
+            # The job is overdue at `start`: the real scheduler would run
+            # it immediately and compute the next run from `start`.
+            candidate = self._compute_next_run(
+                self._as_job_time(start), self._draw_interval(rng)
+            )
+        while len(runs) < limit:
+            if end is not None and candidate > end:
+                break
+            if self._is_overdue(candidate):
+                # The job's deadline (set via until()) is reached.
+                break
+            runs.append(candidate)
+            next_candidate = self._compute_next_run(
+                self._as_job_time(candidate), self._draw_interval(rng)
+            )
+            if next_candidate <= candidate:
+                # Defensive guard: never keep searching without progress.
+                break
+            candidate = next_candidate
+        return runs
+
+    def _as_job_time(self, moment: datetime.datetime) -> datetime.datetime:
+        """
+        Convert a naive local datetime (as stored in `next_run`) back to
+        the timezone in which next-run computations are performed.
+        """
+        if self.at_time_zone is None:
+            return moment
+        return moment.astimezone(self.at_time_zone)
+
     def _schedule_next_run(self) -> None:
         """
         Compute the instant when this job should run next.
+        """
+        # Do all computation in the context of the requested timezone
+        now = datetime.datetime.now(self.at_time_zone)
+        interval = self._draw_interval(random)
+        self.next_run = self._compute_next_run(now, interval)
+
+    def _draw_interval(self, rng) -> int:
+        """
+        Draw the interval for the next run. For jobs scheduled with
+        :meth:`to <Job.to>` a random interval is drawn from `rng`, which
+        may be the `random` module or a `random.Random` instance.
+        """
+        if self.latest is not None:
+            if not (self.latest >= self.interval):
+                raise ScheduleError("`latest` is greater than `interval`")
+            return rng.randint(self.interval, self.latest)
+        return self.interval
+
+    def _compute_next_run(
+        self, now: datetime.datetime, interval: int
+    ) -> datetime.datetime:
+        """
+        Compute the next run after `now` for the given interval.
+
+        This is a pure function of the job configuration: it does not
+        mutate the job and does not consume any random state.
         """
         if self.unit not in ("seconds", "minutes", "hours", "days", "weeks"):
             raise ScheduleValueError(
                 "Invalid unit (valid units are `seconds`, `minutes`, `hours`, "
                 "`days`, and `weeks`)"
             )
-        if self.latest is not None:
-            if not (self.latest >= self.interval):
-                raise ScheduleError("`latest` is greater than `interval`")
-            interval = random.randint(self.interval, self.latest)
-        else:
-            interval = self.interval
-
-        # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
 
         next_run = now
 
@@ -745,7 +885,7 @@ class Job:
 
             next_run = next_run.replace(tzinfo=None)
 
-        self.next_run = next_run
+        return next_run
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
@@ -880,6 +1020,21 @@ def cancel_job(job: Job) -> None:
     :data:`default scheduler instance <default_scheduler>`.
     """
     default_scheduler.cancel_job(job)
+
+
+def preview(
+    start: Optional[datetime.datetime] = None,
+    end: Optional[datetime.datetime] = None,
+    limit: int = 10,
+    tag: Optional[Hashable] = None,
+    seed: Optional[Hashable] = None,
+) -> List[datetime.datetime]:
+    """Calls :meth:`preview <Scheduler.preview>` on the
+    :data:`default scheduler instance <default_scheduler>`.
+    """
+    return default_scheduler.preview(
+        start=start, end=end, limit=limit, tag=tag, seed=seed
+    )
 
 
 def next_run(tag: Optional[Hashable] = None) -> Optional[datetime.datetime]:
