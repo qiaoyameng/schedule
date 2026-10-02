@@ -216,6 +216,24 @@ Run a job at random intervals
 ``every(A).to(B).seconds`` executes the job function every N seconds such that A <= N <= B.
 
 
+Run a job on weekdays inside a maintenance window
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    import datetime
+
+    schedule.every().day.at("01:30", "America/New_York") \
+        .on_weekdays("monday", "tuesday", "wednesday", "thursday", "friday") \
+        .exclude_dates(datetime.date(2026, 1, 1)) \
+        .between("22:00", "06:00") \
+        .do(job)
+
+Calendar constraints apply to fixed daily and weekly jobs. Random interval
+jobs created with ``to()`` cannot be combined with them. See
+:doc:`timezones` for daylight-saving-time details.
+
+
 Run a job until a certain time
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

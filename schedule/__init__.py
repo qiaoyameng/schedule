@@ -45,7 +45,8 @@ import logging
 import random
 import re
 import time
-from typing import Set, List, Optional, Callable, Union
+from math import gcd
+from typing import Set, List, Optional, Callable, Tuple, Union
 
 logger = logging.getLogger("schedule")
 
@@ -238,6 +239,10 @@ class Job:
         # optional time zone of the self.at_time field. Only relevant when at_time is not None
         self.at_time_zone = None
 
+        self.allowed_weekdays: Optional[Set[int]] = None
+        self.excluded_dates: Set[datetime.date] = set()
+        self.time_window: Optional[Tuple[datetime.time, datetime.time]] = None
+
         # datetime of the last run
         self.last_run: Optional[datetime.datetime] = None
 
@@ -253,6 +258,14 @@ class Job:
 
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional[Scheduler] = scheduler  # scheduler to register with
+
+    @property
+    def _has_calendar_constraints(self) -> bool:
+        return (
+            self.allowed_weekdays is not None
+            or bool(self.excluded_dates)
+            or self.time_window is not None
+        )
 
     def __lt__(self, other) -> bool:
         """
@@ -556,6 +569,7 @@ class Job:
         minute = int(minute)
         second = int(second)
         self.at_time = datetime.time(hour, minute, second)
+        self._validate_calendar_constraints()
         return self
 
     def to(self, latest: int):
@@ -570,8 +584,172 @@ class Job:
         :param latest: Maximum interval between randomized job runs
         :return: The invoked job instance
         """
+        if self._has_calendar_constraints:
+            raise ScheduleValueError(
+                "Random intervals cannot be combined with weekday, date or "
+                "time-window constraints"
+            )
         self.latest = latest
         return self
+
+    def on_weekdays(self, *weekdays: Union[int, str]) -> "Job":
+        """
+        Limit a daily or weekly job to the given weekdays.
+
+        :param weekdays: Weekdays as ``monday`` through ``sunday`` or
+            integers where Monday is 0 and Sunday is 6.
+        :return: The invoked job instance
+        """
+        self._validate_calendar_constraint_unit()
+        if not weekdays:
+            raise ScheduleValueError("At least one weekday is required")
+
+        allowed = set()
+        for weekday in weekdays:
+            if isinstance(weekday, str):
+                allowed.add(_weekday_index(weekday))
+            elif isinstance(weekday, int) and 0 <= weekday <= 6:
+                allowed.add(weekday)
+            else:
+                raise ScheduleValueError(
+                    "Weekday must be a name from monday through sunday or "
+                    "an integer from 0 through 6"
+                )
+
+        self.allowed_weekdays = allowed
+        self._validate_calendar_constraints()
+        return self
+
+    def exclude_dates(self, *dates: Union[datetime.date, str]) -> "Job":
+        """
+        Exclude dates from a daily or weekly job.
+
+        Dates are interpreted as local dates in the timezone passed to
+        :meth:`at`.
+
+        :param dates: :class:`datetime.date` values or ``YYYY-MM-DD`` strings.
+        :return: The invoked job instance
+        """
+        self._validate_calendar_constraint_unit()
+        if not dates:
+            raise ScheduleValueError("At least one date is required")
+
+        parsed_dates = set()
+        for value in dates:
+            if isinstance(value, datetime.datetime):
+                raise ScheduleValueError(
+                    "Excluded dates must be date values, not datetime values"
+                )
+            if isinstance(value, datetime.date):
+                parsed_dates.add(value)
+            elif isinstance(value, str):
+                try:
+                    parsed_date = datetime.datetime.strptime(value, "%Y-%m-%d").date()
+                    parsed_dates.add(parsed_date)
+                except ValueError:
+                    raise ScheduleValueError(
+                        "Excluded date must use the YYYY-MM-DD format"
+                    )
+            else:
+                raise ScheduleValueError(
+                    "Excluded date must be a datetime.date or YYYY-MM-DD string"
+                )
+
+        self.excluded_dates.update(parsed_dates)
+        self._validate_calendar_constraints()
+        return self
+
+    def between(
+        self,
+        start: Union[datetime.time, str],
+        end: Union[datetime.time, str],
+    ) -> "Job":
+        """
+        Limit a daily or weekly job to a local time window.
+
+        A window whose end is earlier than its start crosses midnight. For
+        example, ``between("22:00", "06:00")`` includes times from 22:00
+        through 05:59:59 on the following day. When the job has no ``at()``
+        time, it runs at the start of the window.
+
+        :param start: Start time as :class:`datetime.time` or ``HH:MM(:SS)``.
+        :param end: End time as :class:`datetime.time` or ``HH:MM(:SS)``. The
+            end is exclusive.
+        :return: The invoked job instance
+        """
+        self._validate_calendar_constraint_unit()
+        start_time = _parse_constraint_time(start)
+        end_time = _parse_constraint_time(end)
+        if start_time == end_time:
+            raise ScheduleValueError("A time window must have a non-zero duration")
+
+        self.time_window = (start_time, end_time)
+        self._validate_calendar_constraints()
+        return self
+
+    def _validate_calendar_constraint_unit(self) -> None:
+        if self.unit not in ("days", "weeks"):
+            raise ScheduleValueError(
+                "Calendar constraints are only supported for daily and weekly jobs"
+            )
+        if self.latest is not None:
+            raise ScheduleValueError(
+                "Calendar constraints cannot be combined with random intervals"
+            )
+
+    def _validate_calendar_constraints(self) -> None:
+        if not self._has_calendar_constraints:
+            return
+
+        self._validate_calendar_constraint_unit()
+
+        if (
+            self.unit == "days"
+            and self.allowed_weekdays is not None
+            and gcd(self.interval, 7) > 1
+        ):
+            now = datetime.datetime.now(self.at_time_zone)
+            phase_count = 7 // gcd(self.interval, 7)
+            reachable_weekdays = {
+                (now.weekday() + index * self.interval) % 7
+                for index in range(phase_count)
+            }
+            if not reachable_weekdays.intersection(self.allowed_weekdays):
+                raise ScheduleValueError(
+                    "The interval never reaches one of the configured allowed weekdays"
+                )
+
+        if (
+            self.unit == "weeks"
+            and self.start_day is None
+            and self.allowed_weekdays is not None
+            and (
+                len(self.allowed_weekdays) > 1
+                or datetime.datetime.now(self.at_time_zone).weekday()
+                not in self.allowed_weekdays
+            )
+        ):
+            raise ScheduleValueError(
+                "Select a weekday for a weekly job, or use a daily job for "
+                "multiple allowed weekdays"
+            )
+
+        if (
+            self.unit == "weeks"
+            and self.start_day is not None
+            and self.allowed_weekdays is not None
+            and _weekday_index(self.start_day) not in self.allowed_weekdays
+        ):
+            raise ScheduleValueError(
+                "The selected weekly weekday is not included in the allowed weekdays"
+            )
+
+        if self.at_time is not None and self.time_window is not None:
+            start, end = self.time_window
+            if not _time_in_window(self.at_time, start, end):
+                raise ScheduleValueError(
+                    "The at() time is outside the configured time window"
+                )
 
     def until(
         self,
@@ -716,6 +894,10 @@ class Job:
         # Do all computation in the context of the requested timezone
         now = datetime.datetime.now(self.at_time_zone)
 
+        if self._has_calendar_constraints:
+            self.next_run = self._schedule_next_calendar_run(now, interval)
+            return
+
         next_run = now
 
         if self.start_day is not None:
@@ -746,6 +928,87 @@ class Job:
             next_run = next_run.replace(tzinfo=None)
 
         self.next_run = next_run
+
+    def _schedule_next_calendar_run(
+        self, now: datetime.datetime, interval: int
+    ) -> datetime.datetime:
+        period_days = interval * (7 if self.unit == "weeks" else 1)
+        period = datetime.timedelta(days=period_days)
+        fixed_time = self.at_time
+        if fixed_time is None and self.time_window is not None:
+            fixed_time = self.time_window[0]
+
+        candidate_date = now.date()
+        if fixed_time is None:
+            candidate_date += period
+        elif self.unit == "weeks" and self.start_day is not None:
+            candidate_date = _move_to_next_weekday(now, self.start_day).date()
+
+        max_candidates = 7 * (len(self.excluded_dates) + 1) + 1
+        for _ in range(max_candidates):
+            candidate = self._resolve_local_date(candidate_date, fixed_time, now)
+            if self._satisfies_calendar_constraints(candidate, now):
+                if self.at_time_zone is not None:
+                    return candidate.astimezone().replace(tzinfo=None)
+                return candidate
+            candidate_date += period
+
+        raise ScheduleValueError(
+            "No next run satisfies the weekday, date and time-window constraints"
+        )
+
+    def _resolve_local_date(
+        self,
+        candidate_date: datetime.date,
+        fixed_time: Optional[datetime.time],
+        now: datetime.datetime,
+    ) -> datetime.datetime:
+        if fixed_time is not None:
+            local_time = fixed_time
+        else:
+            local_time = now.timetz().replace(tzinfo=None)
+        naive = datetime.datetime.combine(candidate_date, local_time)
+
+        if self.at_time_zone is None:
+            return naive
+
+        import pytz
+
+        try:
+            return self.at_time_zone.localize(naive, is_dst=None)
+        except pytz.exceptions.AmbiguousTimeError:
+            # Repeated local time: always select the first occurrence, which
+            # is the daylight-saving-time side at a fall-back transition.
+            return self.at_time_zone.localize(naive, is_dst=True)
+        except pytz.exceptions.NonExistentTimeError:
+            # Missing local time: move the instant forward to the first valid
+            # moment after the spring-forward gap. The calendar validation may
+            # reject this result and advance to a later date.
+            pre_gap = self.at_time_zone.localize(naive, is_dst=False)
+            return self.at_time_zone.normalize(pre_gap)
+
+    def _satisfies_calendar_constraints(
+        self, candidate: datetime.datetime, now: datetime.datetime
+    ) -> bool:
+        if candidate <= now:
+            return False
+
+        local_date = candidate.date()
+        if (
+            self.allowed_weekdays is not None
+            and local_date.weekday() not in self.allowed_weekdays
+        ):
+            return False
+
+        if local_date in self.excluded_dates:
+            return False
+
+        if self.time_window is not None:
+            start, end = self.time_window
+            if not _time_in_window(candidate.timetz().replace(tzinfo=None), start, end):
+                return False
+
+        return True
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
@@ -943,3 +1206,40 @@ def _weekday_index(day: str) -> int:
             "Invalid start day (valid start days are {})".format(weekdays)
         )
     return weekdays.index(day)
+
+
+def _parse_constraint_time(value: Union[datetime.time, str]) -> datetime.time:
+    if isinstance(value, datetime.time):
+        if value.tzinfo is not None:
+            raise ScheduleValueError("Time-window values must be local naive times")
+        return value.replace(microsecond=0)
+
+    if not isinstance(value, str):
+        raise ScheduleValueError(
+            "Time-window values must be datetime.time or HH:MM(:SS) strings"
+        )
+
+    if value == "24:00":
+        return datetime.time.max
+
+    match = re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", value)
+    if match is None:
+        raise ScheduleValueError(
+            "Invalid time-window format (valid format is HH:MM(:SS)? or 24:00)"
+        )
+
+    parts = [int(part) for part in value.split(":")]
+    if len(parts) == 2:
+        hour, minute = parts
+        second = 0
+    else:
+        hour, minute, second = parts
+    return datetime.time(hour, minute, second)
+
+
+def _time_in_window(
+    moment: datetime.time, start: datetime.time, end: datetime.time
+) -> bool:
+    if start < end:
+        return start <= moment < end
+    return moment >= start or moment < end

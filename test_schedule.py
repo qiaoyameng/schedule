@@ -1153,6 +1153,151 @@ class SchedulerTests(TestCase):
         with self.assertRaises(ScheduleValueError):
             every().day.at("10:30", 43).do(mock_job)
 
+    def test_calendar_constraints_maintenance_week(self):
+        mock_job = self.make_tz_mock_job()
+        import pytz
+
+        with mock_datetime(2024, 10, 25, 12, 0, 0, TZ_BERLIN):
+            job = (
+                every()
+                .day.at("01:00", "America/New_York")
+                .on_weekdays("sunday", "monday", "tuesday", "wednesday", "thursday")
+                .exclude_dates("2024-10-28", "2024-10-31", "2024-11-01")
+                .between("22:00", "06:00")
+                .do(mock_job)
+            )
+
+            expected_runs = [
+                datetime.datetime(2024, 10, 27, 6, 0),
+                datetime.datetime(2024, 10, 29, 6, 0),
+                datetime.datetime(2024, 10, 30, 6, 0),
+                datetime.datetime(2024, 11, 3, 6, 0),
+                datetime.datetime(2024, 11, 4, 7, 0),
+                datetime.datetime(2024, 11, 5, 7, 0),
+            ]
+            new_york = pytz.timezone("America/New_York")
+
+            for expected in expected_runs:
+                assert job.next_run == expected
+                local_run = job.next_run.astimezone(new_york)
+                assert local_run.hour == 1
+                assert local_run.minute == 0
+                assert local_run.weekday() in {0, 1, 2, 3, 6}
+                assert local_run.date() not in {
+                    datetime.date(2024, 10, 28),
+                    datetime.date(2024, 10, 31),
+                    datetime.date(2024, 11, 1),
+                }
+
+                with mock_datetime(
+                    expected.year,
+                    expected.month,
+                    expected.day,
+                    expected.hour,
+                    expected.minute + 1,
+                    0,
+                    TZ_BERLIN,
+                ):
+                    job.run()
+
+    def test_calendar_constraints_weekly(self):
+        mock_job = make_mock_job()
+        with mock_datetime(2024, 10, 25, 12, 0):
+            job = (
+                every()
+                .friday.at("01:00")
+                .exclude_dates("2024-11-01")
+                .between("22:00", "06:00")
+                .do(mock_job)
+            )
+            assert job.next_run == datetime.datetime(2024, 11, 8, 1, 0)
+
+    def test_calendar_constraints_advances_over_many_excluded_dates(self):
+        mock_job = make_mock_job()
+        exclusions = [
+            (datetime.date(2024, 10, 26) + datetime.timedelta(days=index)).isoformat()
+            for index in range(300)
+        ]
+        with mock_datetime(2024, 10, 25, 12, 0):
+            job = (
+                every()
+                .day.at("10:00")
+                .exclude_dates(*exclusions)
+                .do(mock_job)
+            )
+            assert job.next_run == datetime.datetime(2025, 8, 22, 10, 0)
+
+    def test_calendar_constraints_excluded_date_uses_task_timezone(self):
+        mock_job = self.make_tz_mock_job()
+        with mock_datetime(2024, 10, 30, 23, 30, 0, TZ_BERLIN):
+            job = (
+                every()
+                .day.at("00:30", "UTC")
+                .exclude_dates("2024-10-31")
+                .do(mock_job)
+            )
+            assert job.next_run == datetime.datetime(2024, 11, 1, 1, 30)
+
+    def test_calendar_constraints_dst_fold_uses_first_occurrence(self):
+        mock_job = self.make_tz_mock_job()
+        import pytz
+
+        with mock_datetime(2024, 11, 2, 12, 0, 0, TZ_BERLIN):
+            job = (
+                every()
+                .day.at("01:30", "America/New_York")
+                .on_weekdays("sunday", "monday")
+                .exclude_dates("2024-11-04")
+                .between("22:00", "06:00")
+                .do(mock_job)
+            )
+            assert job.next_run == datetime.datetime(2024, 11, 3, 6, 30)
+            local_run = job.next_run.astimezone(
+                pytz.timezone("America/New_York")
+            )
+            assert local_run.date() == datetime.date(2024, 11, 3)
+            assert local_run.hour == 1
+            assert local_run.minute == 30
+            assert local_run.utcoffset() == datetime.timedelta(hours=-4)
+
+    def test_calendar_constraints_dst_gap_advances_by_calendar_date(self):
+        mock_job = self.make_tz_mock_job()
+
+        with mock_datetime(2024, 3, 30, 12, 0, 0, TZ_BERLIN):
+            job = (
+                every()
+                .day.at("02:30", "Europe/Berlin")
+                .on_weekdays("sunday", "monday")
+                .between("22:00", "03:00")
+                .do(mock_job)
+            )
+            assert job.next_run == datetime.datetime(2024, 4, 1, 2, 30)
+
+    def test_calendar_constraint_validation(self):
+        with mock_datetime(2024, 10, 25, 12, 0):
+            with self.assertRaises(ScheduleValueError):
+                every().hour.on_weekdays("monday")
+            with self.assertRaises(ScheduleValueError):
+                every().day.on_weekdays()
+            with self.assertRaises(ScheduleValueError):
+                every().day.exclude_dates()
+            with self.assertRaises(ScheduleValueError):
+                every().day.between("10:00", "10:00")
+            with self.assertRaises(ScheduleValueError):
+                every().day.at("10:00").between("11:00", "12:00")
+            with self.assertRaises(ScheduleValueError):
+                every().friday.on_weekdays("saturday")
+            with self.assertRaises(ScheduleValueError):
+                every().week.on_weekdays("saturday", "sunday")
+            with self.assertRaises(ScheduleValueError):
+                every(7).days.on_weekdays("saturday")
+            with self.assertRaises(ScheduleValueError):
+                every().day.to(2).exclude_dates("2024-10-26")
+            with self.assertRaises(ScheduleValueError):
+                every().day.exclude_dates("2024-10-25").between(
+                    "10:00", "11:00"
+                ).to(2)
+
     def test_align_utc_offset_no_timezone(self):
         job = schedule.every().day.at("10:00").do(make_mock_job())
         now = datetime.datetime(2024, 5, 11, 10, 30, 55, 0)

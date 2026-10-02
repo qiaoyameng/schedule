@@ -76,3 +76,46 @@ So the next run in Berlin time is ``2022 march 20, 15:30:00``:
 
     print(repr(s))
     # Every 1 day at 10:30:00 do job() (last run: [never], next run: 2022-03-20 15:30:00)
+
+Calendar constraints
+~~~~~~~~~~~~~~~~~~~~
+
+Fixed daily and weekly jobs can combine allowed weekdays, excluded dates and a
+local time window:
+
+.. code-block:: python
+
+    schedule.every().day.at("01:30", "America/New_York") \
+        .on_weekdays("monday", "tuesday", "wednesday", "thursday", "friday") \
+        .exclude_dates("2026-01-01") \
+        .between("22:00", "06:00") \
+        .do(job)
+
+``exclude_dates()`` accepts :class:`datetime.date` values or ``YYYY-MM-DD``
+strings. Each date is interpreted in the timezone passed to ``at()``; when no
+timezone is supplied, the process timezone is used.
+
+If the window end is earlier than its start, the window crosses midnight.
+Weekday and excluded-date checks use the final local date in the task
+timezone, while the wall-clock time is checked against the window. For
+example, a run at 01:30 on Saturday needs Saturday to be allowed and must
+not be excluded; its wall-clock time is accepted by ``between("22:00",
+"06:00")``. The final local timestamp is checked after DST resolution, so a
+spring-forward adjustment cannot move a run back onto an excluded date or
+into an unallowed weekday.
+
+When a configured local time does not exist during a spring-forward gap, the
+run is moved forward to the valid moment after the gap. If that no longer
+satisfies the weekday or window, the scheduler advances by the job's calendar
+interval (one day or one week, for example) rather than scanning second by
+second. During a fall-back overlap, the first occurrence of the repeated local
+time is selected.
+
+Impossible configurations raise ``ScheduleValueError`` while the job is being
+defined, for example when a weekly weekday is not allowed, the ``at()`` time is
+outside the window, or the interval can never reach an allowed weekday.
+
+Randomized interval jobs created with ``to()`` do not support these calendar
+constraints. This includes random second, minute, hour, day and week intervals.
+Use a fixed daily or weekly interval when combining ``on_weekdays()``,
+``exclude_dates()`` or ``between()``.
