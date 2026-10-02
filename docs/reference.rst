@@ -28,6 +28,10 @@ Classes
    :members:
    :undoc-members:
 
+.. autoclass:: schedule.ThreadSafeScheduler
+   :members:
+   :undoc-members:
+
 .. autoclass:: schedule.Job
    :members:
    :undoc-members:

@@ -5,6 +5,7 @@ import functools
 from unittest import mock, TestCase
 import os
 import time
+from threading import Barrier, Event, Thread
 
 # Silence "missing docstring", "method could be a function",
 # "class already defined", and "too many public methods" messages:
@@ -1597,3 +1598,138 @@ class SchedulerTests(TestCase):
         scheduler.every()
         scheduler.every(10).seconds
         scheduler.run_pending()
+
+    def test_thread_safe_run_pending_claims_due_job_once(self):
+        scheduler = schedule.ThreadSafeScheduler()
+        claim_barrier = Barrier(2)
+        callback_started = Event()
+        release_callback = Event()
+        winner_selected = Event()
+        loser_finished = Event()
+        calls = []
+        observed_due = []
+
+        job = scheduler.every().second.do(lambda: None)
+        other_job = scheduler.every().second.do(lambda: None)
+        past = datetime.datetime(2000, 1, 1)
+        job.next_run = past
+        other_job.next_run = past
+
+        def change_schedule():
+            calls.append(1)
+            callback_started.set()
+            assert loser_finished.wait(2)
+            assert release_callback.wait(2)
+            job.next_run = datetime.datetime(2024, 1, 1, 2, 0, 0)
+
+        job.job_func = functools.partial(change_schedule)
+        original_claim = scheduler._claim_job
+
+        def claim(job_to_run, scheduled, direct):
+            if job_to_run is job:
+                observed_due.append(job_to_run.should_run)
+                claim_barrier.wait(2)
+                claimed = original_claim(job_to_run, scheduled, direct)
+                if claimed:
+                    winner_selected.set()
+                else:
+                    loser_finished.set()
+                return claimed
+            return original_claim(job_to_run, scheduled, direct)
+
+        scheduler._claim_job = claim
+
+        def run_pending():
+            scheduler.run_pending()
+
+        first_poller = Thread(target=run_pending)
+        second_poller = Thread(target=run_pending)
+        first_poller.start()
+        second_poller.start()
+        assert callback_started.wait(2)
+        assert loser_finished.wait(2)
+        release_callback.set()
+        assert observed_due == [True, True]
+        assert winner_selected.is_set()
+
+        first_poller.join(2)
+        second_poller.join(2)
+        assert not first_poller.is_alive()
+        assert not second_poller.is_alive()
+        assert len(calls) == 1
+        assert job.next_run == datetime.datetime(2024, 1, 1, 2, 0, 0)
+        assert other_job.last_run is not None
+
+    def test_thread_safe_run_all_and_direct_run_share_claim(self):
+        scheduler = schedule.Scheduler(thread_safe=True)
+        callback_started = Event()
+        release_callback = Event()
+        direct_result = []
+
+        def job():
+            callback_started.set()
+            assert release_callback.wait(2)
+
+        scheduled_job = scheduler.every().second.do(job)
+        scheduled_job.next_run = datetime.datetime(2000, 1, 1)
+
+        def run_pending():
+            scheduler.run_pending()
+
+        runner = Thread(target=run_pending)
+        runner.start()
+        assert callback_started.wait(2)
+
+        direct_result.append(scheduled_job.run())
+        scheduler.run_all()
+        release_callback.set()
+        runner.join(2)
+
+        assert direct_result == [None]
+
+        assert not runner.is_alive()
+
+    def test_thread_safe_job_can_be_added_canceled_or_rescheduled(self):
+        scheduler = schedule.Scheduler(thread_safe=True)
+        past = datetime.datetime(2000, 1, 1)
+        future = datetime.datetime(2100, 1, 1)
+
+        def canceling_job():
+            return schedule.CancelJob
+
+        canceled_job = scheduler.every().second.do(canceling_job)
+        canceled_job.next_run = past
+
+        added_job_holder = []
+
+        def rescheduling_job():
+            changed_job.next_run = future
+            added_job_holder.append(scheduler.every().second.do(lambda: None))
+
+        changed_job = scheduler.every().second.do(rescheduling_job)
+        changed_job.next_run = past
+
+        scheduler.run_pending()
+
+        assert canceled_job not in scheduler.jobs
+        assert changed_job.next_run == future
+        assert added_job_holder and added_job_holder[0] in scheduler.jobs
+
+    def test_thread_safe_runner_releases_claim_after_failure(self):
+        scheduler = schedule.Scheduler(thread_safe=True)
+
+        def failing_job():
+            raise RuntimeError("boom")
+
+        job = scheduler.every().second.do(failing_job)
+        job.next_run = datetime.datetime(2000, 1, 1)
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            scheduler.run_pending()
+
+        assert job._running is False
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            job.run()
+
+        assert job._running is False
