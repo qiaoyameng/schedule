@@ -216,6 +216,39 @@ Run a job at random intervals
 ``every(A).to(B).seconds`` executes the job function every N seconds such that A <= N <= B.
 
 
+Keep a fixed cadence
+~~~~~~~~~~~~~~~~~~~~
+
+By default, jobs reschedule from the current time. Use ``fixed_cadence()`` to
+keep the original schedule, even when a job takes some time to run. The job
+function may declare a ``scheduled_time`` argument to receive the logical
+time for which it was invoked.
+
+.. code-block:: python
+
+    from datetime import datetime
+    import schedule
+
+    scheduler = schedule.Scheduler(clock=datetime.now)
+
+    def job(scheduled_time):
+        print('Running planned run', scheduled_time)
+
+    # Ignore runs that were already missed.
+    scheduler.every(10).seconds.fixed_cadence("skip").do(job)
+
+    # Run once and coalesce all missed runs into that invocation.
+    scheduler.every(10).seconds.fixed_cadence("merge").do(job)
+
+    # Run missed invocations individually, at most two per run_pending() call.
+    scheduler.every(10).seconds.fixed_cadence(
+        "catch_up", catch_up_limit=2
+    ).do(job)
+
+    while True:
+        scheduler.run_pending()
+
+
 Run a job until a certain time
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -41,6 +41,7 @@ Usage:
 from collections.abc import Hashable
 import datetime
 import functools
+import inspect
 import logging
 import random
 import re
@@ -76,6 +77,16 @@ class CancelJob:
     pass
 
 
+MISSED_RUN_SKIP = "skip"
+MISSED_RUN_MERGE = "merge"
+MISSED_RUN_CATCH_UP = "catch_up"
+_MISSED_RUN_POLICIES = {
+    MISSED_RUN_SKIP,
+    MISSED_RUN_MERGE,
+    MISSED_RUN_CATCH_UP,
+}
+
+
 class Scheduler:
     """
     Objects instantiated by the :class:`Scheduler <Scheduler>` are
@@ -83,8 +94,17 @@ class Scheduler:
     handle their execution.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        clock: Optional[Callable[..., datetime.datetime]] = None,
+    ) -> None:
         self.jobs: List[Job] = []
+        self._clock = clock
+
+    def now(self, tz: Optional[datetime.tzinfo] = None) -> datetime.datetime:
+        if self._clock is None:
+            return datetime.datetime.now(tz)
+        return self._clock(tz)
 
     def run_pending(self) -> None:
         """
@@ -94,7 +114,8 @@ class Scheduler:
         does not run missed jobs*. For example, if you've registered a job
         that should run every minute and you only call run_pending()
         in one hour increments then your job won't be run 60 times in
-        between but only once.
+        between but only once. Jobs configured with ``fixed_cadence()``
+        and ``MISSED_RUN_CATCH_UP`` are the explicit exception.
         """
         runnable_jobs = (job for job in self.jobs if job.should_run)
         for job in sorted(runnable_jobs):
@@ -116,7 +137,7 @@ class Scheduler:
             delay_seconds,
         )
         for job in self.jobs[:]:
-            self._run_job(job)
+            self._run_job(job, force=True)
             time.sleep(delay_seconds)
 
     def get_jobs(self, tag: Optional[Hashable] = None) -> List["Job"]:
@@ -169,8 +190,8 @@ class Scheduler:
         job = Job(interval, self)
         return job
 
-    def _run_job(self, job: "Job") -> None:
-        ret = job.run()
+    def _run_job(self, job: "Job", force: bool = False) -> None:
+        ret = job._run_due(force=force)
         if isinstance(ret, CancelJob) or ret is CancelJob:
             self.cancel_job(job)
 
@@ -203,7 +224,7 @@ class Scheduler:
         """
         if not self.next_run:
             return None
-        return (self.next_run - datetime.datetime.now()).total_seconds()
+        return (self.next_run - self.now()).total_seconds()
 
 
 class Job:
@@ -243,6 +264,11 @@ class Job:
 
         # datetime of the next run
         self.next_run: Optional[datetime.datetime] = None
+
+        self.is_fixed_cadence: bool = False
+        self.missed_runs_policy: Optional[str] = None
+        self.catch_up_limit: int = 1
+        self.scheduled_run_time: Optional[datetime.datetime] = None
 
         # Weekday to run the job at. Only relevant when unit is 'weeks'.
         # For example, when asking 'every week on tuesday' the start_day is 'tuesday'.
@@ -573,6 +599,39 @@ class Job:
         self.latest = latest
         return self
 
+    def fixed_cadence(
+        self,
+        missed_runs: str = MISSED_RUN_MERGE,
+        catch_up_limit: int = 1,
+    ) -> "Job":
+        """
+        Keep jobs aligned to the originally scheduled cadence.
+
+        :param missed_runs: How to handle scheduled runs that are already due.
+            ``skip`` does not run them, ``merge`` coalesces them into one run,
+            and ``catch_up`` runs them individually.
+        :param catch_up_limit: Maximum number of runs to execute for a job in
+            one ``run_pending()`` call when ``missed_runs`` is ``catch_up``.
+        :return: The invoked job instance
+        """
+        if missed_runs not in _MISSED_RUN_POLICIES:
+            raise ScheduleValueError(
+                "missed_runs must be 'skip', 'merge', or 'catch_up'"
+            )
+        if (
+            not isinstance(catch_up_limit, int)
+            or isinstance(catch_up_limit, bool)
+            or catch_up_limit < 1
+        ):
+            raise ScheduleValueError(
+                "catch_up_limit must be a positive integer"
+            )
+
+        self.is_fixed_cadence = True
+        self.missed_runs_policy = missed_runs
+        self.catch_up_limit = catch_up_limit
+        return self
+
     def until(
         self,
         until_time: Union[datetime.datetime, datetime.timedelta, datetime.time, str],
@@ -605,10 +664,10 @@ class Job:
         if isinstance(until_time, datetime.datetime):
             self.cancel_after = until_time
         elif isinstance(until_time, datetime.timedelta):
-            self.cancel_after = datetime.datetime.now() + until_time
+            self.cancel_after = self._now() + until_time
         elif isinstance(until_time, datetime.time):
             self.cancel_after = datetime.datetime.combine(
-                datetime.datetime.now(), until_time
+                self._now(), until_time
             )
         elif isinstance(until_time, str):
             cancel_after = self._decode_datetimestr(
@@ -625,7 +684,7 @@ class Job:
                 raise ScheduleValueError("Invalid string format for until()")
             if "-" not in until_time:
                 # the until_time is a time-only format. Set the date to today
-                now = datetime.datetime.now()
+                now = self._now()
                 cancel_after = cancel_after.replace(
                     year=now.year, month=now.month, day=now.day
                 )
@@ -635,7 +694,7 @@ class Job:
                 "until() takes a string, datetime.datetime, datetime.timedelta, "
                 "datetime.time parameter"
             )
-        if self.cancel_after < datetime.datetime.now():
+        if self.cancel_after < self._now():
             raise ScheduleValueError(
                 "Cannot schedule a job to run until a time in the past"
             )
@@ -669,7 +728,7 @@ class Job:
         :return: ``True`` if the job should be run now.
         """
         assert self.next_run is not None, "must run _schedule_next_run before"
-        return datetime.datetime.now() >= self.next_run
+        return self._now() >= self.next_run
 
     def run(self):
         """
@@ -683,19 +742,100 @@ class Job:
                  deadline is reached.
 
         """
-        if self._is_overdue(datetime.datetime.now()):
+        scheduled_time = self.next_run if self.is_fixed_cadence else self._now()
+        if self._is_overdue(scheduled_time):
             logger.debug("Cancelling job %s", self)
             return CancelJob
 
         logger.debug("Running job %s", self)
-        ret = self.job_func()
-        self.last_run = datetime.datetime.now()
+        if self.is_fixed_cadence:
+            self.scheduled_run_time = self.next_run
+            ret = self._call_job_func(self.next_run)
+        else:
+            ret = self.job_func()
+        self.last_run = self._now()
         self._schedule_next_run()
 
         if self._is_overdue(self.next_run):
             logger.debug("Cancelling job %s", self)
             return CancelJob
         return ret
+
+    def _run_due(self, force: bool = False):
+        if force:
+            return self.run()
+        if not self.is_fixed_cadence:
+            return self.run()
+
+        maximum_runs = (
+            self.catch_up_limit
+            if self.missed_runs_policy == MISSED_RUN_CATCH_UP
+            else 1
+        )
+        run_count = 0
+        result = None
+
+        while True:
+            now = self._now()
+            if self.next_run is None or self.next_run > now:
+                return result
+
+            if (
+                run_count == 0
+                and self.next_run < now
+                and self.missed_runs_policy == MISSED_RUN_SKIP
+            ):
+                self._skip_due_runs(now)
+                if self._is_overdue(self.next_run):
+                    return CancelJob
+                return result
+
+            if run_count >= maximum_runs:
+                return result
+
+            result = self.run()
+            run_count += 1
+            if isinstance(result, CancelJob) or result is CancelJob:
+                return result
+
+            if self.missed_runs_policy in (
+                MISSED_RUN_SKIP,
+                MISSED_RUN_MERGE,
+            ):
+                now = self._now()
+                if self.next_run <= now:
+                    self._skip_due_runs(now)
+                if self._is_overdue(self.next_run):
+                    return CancelJob
+                return result
+
+    def _skip_due_runs(self, now: datetime.datetime) -> None:
+        while self.next_run is not None and self.next_run <= now:
+            self._schedule_next_run()
+
+    def _call_job_func(
+        self, scheduled_time: datetime.datetime
+    ):
+        if self._accepts_run_time_parameter("scheduled_time"):
+            return self.job_func(scheduled_time=scheduled_time)
+        if self._accepts_run_time_parameter("planned_time"):
+            return self.job_func(planned_time=scheduled_time)
+        return self.job_func()
+
+    def _accepts_run_time_parameter(self, name: str) -> bool:
+        try:
+            parameter = inspect.signature(self.job_func).parameters.get(name)
+        except (TypeError, ValueError):
+            return False
+        return parameter is not None and parameter.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+
+    def _now(self, tz: Optional[datetime.tzinfo] = None) -> datetime.datetime:
+        if self.scheduler is not None:
+            return self.scheduler.now(tz)
+        return datetime.datetime.now(tz)
 
     def _schedule_next_run(self) -> None:
         """
@@ -706,6 +846,11 @@ class Job:
                 "Invalid unit (valid units are `seconds`, `minutes`, `hours`, "
                 "`days`, and `weeks`)"
             )
+        if self.is_fixed_cadence and self.latest is not None:
+            raise ScheduleError(
+                "Fixed cadence cannot use randomized `.to()` intervals"
+            )
+
         if self.latest is not None:
             if not (self.latest >= self.interval):
                 raise ScheduleError("`latest` is greater than `interval`")
@@ -714,28 +859,43 @@ class Job:
             interval = self.interval
 
         # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
-
-        next_run = now
-
-        if self.start_day is not None:
-            if self.unit != "weeks":
-                raise ScheduleValueError("`unit` should be 'weeks'")
-            next_run = _move_to_next_weekday(next_run, self.start_day)
-
-        if self.at_time is not None:
-            next_run = self._move_to_at_time(next_run)
-
+        now = self._now(self.at_time_zone)
         period = datetime.timedelta(**{self.unit: interval})
-        if interval != 1:
-            next_run += period
 
-        while next_run <= now:
+        if self.is_fixed_cadence and self.next_run is not None:
+            next_run = self.next_run
+            if self.at_time_zone is not None:
+                local_time_zone = self._now().astimezone().tzinfo
+                next_run = next_run.replace(tzinfo=local_time_zone).astimezone(
+                    self.at_time_zone
+                )
             next_run += period
+            if self.at_time is not None:
+                next_run = self._move_to_at_time(next_run)
 
-        next_run = self._correct_utc_offset(
-            next_run, fixate_time=(self.at_time is not None)
-        )
+            next_run = self._correct_utc_offset(
+                next_run, fixate_time=(self.at_time is not None)
+            )
+        else:
+            next_run = now
+
+            if self.start_day is not None:
+                if self.unit != "weeks":
+                    raise ScheduleValueError("`unit` should be 'weeks'")
+                next_run = _move_to_next_weekday(next_run, self.start_day)
+
+            if self.at_time is not None:
+                next_run = self._move_to_at_time(next_run)
+
+            if interval != 1:
+                next_run += period
+
+            while next_run <= now:
+                next_run += period
+
+            next_run = self._correct_utc_offset(
+                next_run, fixate_time=(self.at_time is not None)
+            )
 
         # To keep the api consistent with older versions, we have to set the 'next_run' to a naive timestamp in the local timezone.
         # Because we want to stay backwards compatible with older versions.
