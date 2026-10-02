@@ -1597,3 +1597,294 @@ class SchedulerTests(TestCase):
         scheduler.every()
         scheduler.every(10).seconds
         scheduler.run_pending()
+
+
+class FakeClock:
+    """
+    A manually advanced clock that can be injected into a Scheduler,
+    so tests can simulate slow executions and time jumps without
+    real sleeping.
+    """
+
+    def __init__(self, start):
+        self.current = start
+
+    def __call__(self):
+        return self.current
+
+    def advance(self, **kwargs):
+        self.current += datetime.timedelta(**kwargs)
+
+
+class FixedCadenceTests(TestCase):
+    """
+    Tests for fixed-cadence scheduling (Job.fixed_cadence) using an
+    injected clock and jobs that advance the clock while "executing".
+    """
+
+    # A base time safely in the future, so until() validation against
+    # the real wall clock does not interfere.
+    BASE = datetime.datetime(2030, 1, 1, 12, 0, 0)
+
+    def make_scheduler(self):
+        clock = FakeClock(self.BASE)
+        return schedule.Scheduler(clock=clock), clock
+
+    def test_fixed_cadence_slow_execution_keeps_rhythm(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence()
+
+        def slow_task():
+            # The planned moment this run belongs to
+            planned.append(job.next_run)
+            clock.advance(seconds=3)  # simulate a 3 second execution
+
+        job.do(slow_task)
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=10)
+
+        clock.advance(seconds=10)  # 12:00:10
+        scheduler.run_pending()
+        # Next run is anchored to the planned rhythm, not to the moment
+        # the previous run finished (12:00:13).
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=20)
+
+        clock.advance(seconds=7)  # 12:00:20
+        scheduler.run_pending()
+        assert planned == [
+            self.BASE + datetime.timedelta(seconds=10),
+            self.BASE + datetime.timedelta(seconds=20),
+        ]
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=30)
+
+    def test_default_schedule_drifts_after_slow_execution(self):
+        # Without fixed_cadence the existing behavior is unchanged:
+        # the interval is counted from the end of the previous run.
+        scheduler, clock = self.make_scheduler()
+
+        job = scheduler.every(10).seconds
+
+        def slow_task():
+            clock.advance(seconds=3)
+
+        job.do(slow_task)
+        clock.advance(seconds=10)  # 12:00:10
+        scheduler.run_pending()
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=23)
+
+    def test_fixed_cadence_coalesce_merges_missed_runs(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence(
+            missed=schedule.MISSED_COALESCE
+        )
+
+        def task():
+            planned.append(job.next_run)
+            clock.advance(seconds=3)
+
+        job.do(task)
+        # A large time jump: the runs planned at 12:00:10 .. 12:01:00
+        # are all missed.
+        clock.advance(seconds=65)  # 12:01:05
+        scheduler.run_pending()
+        # All missed runs are merged into a single run, executed for
+        # the first missed planned moment.
+        assert planned == [self.BASE + datetime.timedelta(seconds=10)]
+        # The schedule jumps to the first planned run in the future.
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=70)
+
+    def test_fixed_cadence_skip_discards_missed_runs(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence(missed=schedule.MISSED_SKIP)
+
+        def task():
+            planned.append(job.next_run)
+
+        job.do(task)
+        clock.advance(seconds=65)  # 12:01:05, several runs missed
+        scheduler.run_pending()
+        # The stale planned runs are skipped without executing the job.
+        assert planned == []
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=70)
+
+        # A run that is merely late (but not stale) still executes.
+        clock.advance(seconds=12)  # 12:01:17
+        scheduler.run_pending()
+        assert planned == [self.BASE + datetime.timedelta(seconds=70)]
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=80)
+
+    def test_fixed_cadence_catch_up_is_bounded(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence(
+            missed=schedule.MISSED_CATCH_UP, max_catch_up=3
+        )
+
+        def task():
+            planned.append(job.next_run)
+
+        job.do(task)
+        clock.advance(seconds=65)  # 12:01:05, six runs are due
+        scheduler.run_pending()
+        # At most max_catch_up runs per run_pending() call.
+        assert planned == [
+            self.BASE + datetime.timedelta(seconds=10),
+            self.BASE + datetime.timedelta(seconds=20),
+            self.BASE + datetime.timedelta(seconds=30),
+        ]
+        # The remaining missed runs stay pending.
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=40)
+        assert job.should_run
+
+        scheduler.run_pending()
+        assert planned[-3:] == [
+            self.BASE + datetime.timedelta(seconds=40),
+            self.BASE + datetime.timedelta(seconds=50),
+            self.BASE + datetime.timedelta(seconds=60),
+        ]
+        # Caught up: the next planned run is in the future again.
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=70)
+        assert not job.should_run
+
+    def test_fixed_cadence_catch_up_stops_on_cancel_job(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence(
+            missed=schedule.MISSED_CATCH_UP, max_catch_up=5
+        )
+
+        def task():
+            planned.append(job.next_run)
+            if len(planned) == 2:
+                return schedule.CancelJob
+
+        job.do(task)
+        clock.advance(seconds=65)  # 12:01:05, six runs are due
+        scheduler.run_pending()
+        # Catching up stops immediately when the job cancels itself.
+        assert planned == [
+            self.BASE + datetime.timedelta(seconds=10),
+            self.BASE + datetime.timedelta(seconds=20),
+        ]
+        assert len(scheduler.jobs) == 0
+
+    def test_fixed_cadence_catch_up_stops_on_exception(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        job = scheduler.every(10).seconds.fixed_cadence(
+            missed=schedule.MISSED_CATCH_UP, max_catch_up=5
+        )
+
+        def task():
+            planned.append(job.next_run)
+            if len(planned) == 2:
+                raise RuntimeError("job failed")
+
+        job.do(task)
+        clock.advance(seconds=65)  # 12:01:05, six runs are due
+        self.assertRaises(RuntimeError, scheduler.run_pending)
+        # No blind catching up after the failure.
+        assert planned == [
+            self.BASE + datetime.timedelta(seconds=10),
+            self.BASE + datetime.timedelta(seconds=20),
+        ]
+        # The failed planned run stays pending and the job is kept.
+        assert job.next_run == self.BASE + datetime.timedelta(seconds=20)
+        assert len(scheduler.jobs) == 1
+
+    def test_fixed_cadence_until_uses_planned_time(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        deadline = self.BASE + datetime.timedelta(seconds=35)
+        job = scheduler.every(10).seconds.fixed_cadence(
+            missed=schedule.MISSED_CATCH_UP, max_catch_up=10
+        )
+
+        def task():
+            planned.append(job.next_run)
+
+        job.do(task).until(deadline)
+        # Jump past the deadline: now is 12:01:00, but the planned runs
+        # at 12:00:10, 12:00:20 and 12:00:30 are all before the deadline.
+        clock.advance(seconds=60)
+        scheduler.run_pending()
+        # The deadline is judged against the planned moments, so the
+        # planned runs before the deadline still execute.
+        assert planned == [
+            self.BASE + datetime.timedelta(seconds=10),
+            self.BASE + datetime.timedelta(seconds=20),
+            self.BASE + datetime.timedelta(seconds=30),
+        ]
+        # The next planned run (12:00:40) falls after the deadline, so
+        # the job is canceled.
+        assert len(scheduler.jobs) == 0
+
+    def test_fixed_cadence_until_cancels_without_running(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        deadline = self.BASE + datetime.timedelta(seconds=5)
+        job = scheduler.every(10).seconds.fixed_cadence()
+
+        def task():
+            planned.append(job.next_run)
+
+        job.do(task).until(deadline)
+        # Jump so far that even the first planned run is past the deadline.
+        clock.advance(seconds=60)
+        scheduler.run_pending()
+        assert planned == []
+        assert len(scheduler.jobs) == 0
+
+    def test_fixed_cadence_until_boundary_run_still_executes(self):
+        scheduler, clock = self.make_scheduler()
+        planned = []
+
+        # The first planned run (12:00:10) is before the deadline, the
+        # second one (12:00:20) is after it.
+        deadline = self.BASE + datetime.timedelta(seconds=15)
+        job = scheduler.every(10).seconds.fixed_cadence()
+
+        def task():
+            planned.append(job.next_run)
+
+        job.do(task).until(deadline)
+        clock.advance(seconds=60)  # execute long after the deadline
+        scheduler.run_pending()
+        # The planned run before the deadline still executes, then the
+        # job is canceled because the next planned run is too late.
+        assert planned == [self.BASE + datetime.timedelta(seconds=10)]
+        assert len(scheduler.jobs) == 0
+
+    def test_fixed_cadence_rejects_invalid_options(self):
+        scheduler, _ = self.make_scheduler()
+        self.assertRaises(
+            ScheduleValueError,
+            scheduler.every(10).seconds.fixed_cadence,
+            missed="bogus",
+        )
+        self.assertRaises(
+            ScheduleValueError,
+            scheduler.every(10).seconds.fixed_cadence,
+            missed=schedule.MISSED_CATCH_UP,
+            max_catch_up=0,
+        )
+        # A randomized interval cannot be combined with a fixed cadence.
+        self.assertRaises(
+            ScheduleError,
+            scheduler.every(5).to(10).seconds.fixed_cadence,
+        )
+        self.assertRaises(
+            ScheduleError,
+            scheduler.every(5).seconds.fixed_cadence().to,
+            10,
+        )

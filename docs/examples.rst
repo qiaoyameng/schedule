@@ -244,6 +244,41 @@ Run a job until a certain time
 
 The ``until`` method sets the jobs deadline. The job will not run after the deadline.
 
+Run a job on a fixed cadence
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default the interval is counted from the moment the previous run
+*finished*: a job that runs every 10 seconds and takes 3 seconds to
+execute starts again 13 seconds after its previous start. Use
+``fixed_cadence()`` to anchor the schedule to the planned run times
+instead, so a slow execution does not shift the rhythm:
+
+.. code-block:: python
+
+    # Runs at planned moments 0s, 10s, 20s, ... no matter how long
+    # each execution takes.
+    schedule.every(10).seconds.fixed_cadence().do(job)
+
+When the scheduler falls behind and planned runs are missed (e.g. the
+process was suspended), the ``missed`` policy decides what happens:
+
+.. code-block:: python
+
+    # Skip missed runs entirely (default is "coalesce").
+    schedule.every(10).seconds.fixed_cadence(missed="skip").do(job)
+
+    # Merge all missed runs into a single run.
+    schedule.every(10).seconds.fixed_cadence(missed="coalesce").do(job)
+
+    # Make up missed runs one by one, at most 3 per run_pending() call.
+    schedule.every(10).seconds.fixed_cadence(
+        missed="catch_up", max_catch_up=3
+    ).do(job)
+
+Catching up stops immediately when the job returns ``schedule.CancelJob``
+or raises an exception. The deadline set via ``until()`` is evaluated
+against the planned run times, not the moment a run actually executes.
+
 Time until the next execution
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Use ``schedule.idle_seconds()`` to get the number of seconds until the next job is scheduled to run.

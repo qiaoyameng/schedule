@@ -3,6 +3,19 @@
 History
 -------
 
+Unreleased
+++++++++++
+
+- Add fixed-cadence scheduling via ``Job.fixed_cadence()``: the next run is
+  anchored to the planned run times instead of the moment the previous run
+  finished. Missed runs can be skipped, coalesced into a single run, or made
+  up with a per-``run_pending()`` bound (``missed="skip" | "coalesce" |
+  "catch_up"``, ``max_catch_up``). The ``until()`` deadline is evaluated
+  against the planned run times for fixed-cadence jobs.
+- Add optional clock injection via ``Scheduler(clock=...)`` to make
+  scheduling decisions testable without sleeping.
+
+
 1.2.2 (2024-05-25)
 ++++++++++++++++++
 

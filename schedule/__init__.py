@@ -76,15 +76,47 @@ class CancelJob:
     pass
 
 
+#: Policy for fixed-cadence jobs: missed runs are skipped entirely.
+MISSED_SKIP = "skip"
+
+#: Policy for fixed-cadence jobs: all missed runs are merged into a single run.
+MISSED_COALESCE = "coalesce"
+
+#: Policy for fixed-cadence jobs: missed runs are made up one by one,
+#: bounded by ``max_catch_up`` per :meth:`Scheduler.run_pending` call.
+MISSED_CATCH_UP = "catch_up"
+
+MISSED_POLICIES = (MISSED_SKIP, MISSED_COALESCE, MISSED_CATCH_UP)
+
+
 class Scheduler:
     """
     Objects instantiated by the :class:`Scheduler <Scheduler>` are
     factories to create jobs, keep record of scheduled jobs and
     handle their execution.
+
+    :param clock: A callable returning the current
+        :class:`~datetime.datetime`, used instead of
+        ``datetime.datetime.now`` for all scheduling decisions.
+        Mainly useful for testing. Defaults to
+        ``datetime.datetime.now``.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, clock: Optional[Callable[[], datetime.datetime]] = None
+    ) -> None:
         self.jobs: List[Job] = []
+        self._clock = clock
+
+    @property
+    def clock(self) -> Callable[[], datetime.datetime]:
+        """
+        The callable used to determine the current time. Defaults to
+        ``datetime.datetime.now`` unless a custom clock was injected.
+        """
+        if self._clock is not None:
+            return self._clock
+        return datetime.datetime.now
 
     def run_pending(self) -> None:
         """
@@ -94,7 +126,10 @@ class Scheduler:
         does not run missed jobs*. For example, if you've registered a job
         that should run every minute and you only call run_pending()
         in one hour increments then your job won't be run 60 times in
-        between but only once.
+        between but only once. Jobs configured with
+        :meth:`Job.fixed_cadence` may deviate from this: depending on
+        their missed-run policy they skip, coalesce or make up missed
+        runs (bounded by ``max_catch_up`` per run_pending() call).
         """
         runnable_jobs = (job for job in self.jobs if job.should_run)
         for job in sorted(runnable_jobs):
@@ -203,7 +238,7 @@ class Scheduler:
         """
         if not self.next_run:
             return None
-        return (self.next_run - datetime.datetime.now()).total_seconds()
+        return (self.next_run - self.clock()).total_seconds()
 
 
 class Job:
@@ -250,6 +285,16 @@ class Job:
 
         # optional time of final run
         self.cancel_after: Optional[datetime.datetime] = None
+
+        # How to handle missed runs when fixed-cadence scheduling is
+        # enabled. None means the default scheduling behavior, where the
+        # next run is computed from the moment the previous run finished.
+        self.missed_policy: Optional[str] = None
+
+        # Maximum number of runs of this job per run_pending() call when
+        # catching up on missed runs. Only relevant when missed_policy
+        # is MISSED_CATCH_UP.
+        self.max_catch_up: int = 5
 
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional[Scheduler] = scheduler  # scheduler to register with
@@ -570,7 +615,74 @@ class Job:
         :param latest: Maximum interval between randomized job runs
         :return: The invoked job instance
         """
+        if self.missed_policy is not None:
+            raise ScheduleError(
+                "to() cannot be combined with fixed_cadence(): "
+                "a fixed cadence requires a fixed interval"
+            )
         self.latest = latest
+        return self
+
+    def fixed_cadence(self, missed: str = MISSED_COALESCE, max_catch_up: int = 5):
+        """
+        Schedule the job on a fixed cadence, anchored to the planned
+        (logical) run times instead of the moment the previous run
+        finished.
+
+        With the default scheduling behavior, a job that runs every 10
+        seconds and takes 3 seconds to execute is scheduled again 10
+        seconds *after it finished*, i.e. 13 seconds after its previous
+        start. With fixed cadence enabled, the job keeps its planned
+        rhythm: the next run is planned exactly one interval after the
+        previous planned run, so a slow execution does not shift the
+        schedule.
+
+        When the scheduler falls behind (e.g. the process was busy or
+        suspended and one or more planned runs were missed), the
+        `missed` policy decides what happens:
+
+        - ``schedule.MISSED_SKIP`` (``"skip"``): missed runs are
+          discarded. If the currently planned run is already stale (the
+          next planned run is also in the past), it is not executed and
+          the schedule jumps to the first planned run in the future.
+        - ``schedule.MISSED_COALESCE`` (``"coalesce"``): all missed
+          runs are merged into a single run. The job runs once, no
+          matter how many planned runs were missed, and the schedule
+          jumps to the first planned run in the future.
+        - ``schedule.MISSED_CATCH_UP`` (``"catch_up"``): missed runs
+          are made up one by one, at most `max_catch_up` runs per
+          :meth:`Scheduler.run_pending` call. Remaining missed runs
+          stay pending and are made up by subsequent calls. Catching up
+          stops immediately when the job returns
+          :class:`CancelJob <CancelJob>` or raises an exception.
+
+        The deadline set via :meth:`until <Job.until>` is evaluated
+        against the planned run times, not the moment a run actually
+        executes: a planned run at or before the deadline still runs
+        even if it executes late, and the job is canceled once the next
+        planned run falls after the deadline.
+
+        :param missed: One of ``schedule.MISSED_SKIP``,
+            ``schedule.MISSED_COALESCE`` or ``schedule.MISSED_CATCH_UP``.
+        :param max_catch_up: Maximum number of runs per
+            :meth:`Scheduler.run_pending` call when catching up missed
+            runs. Only used with ``schedule.MISSED_CATCH_UP``.
+        :return: The invoked job instance
+        """
+        if missed not in MISSED_POLICIES:
+            raise ScheduleValueError(
+                "Invalid missed policy (valid policies are %s)"
+                % ", ".join(repr(p) for p in MISSED_POLICIES)
+            )
+        if self.latest is not None:
+            raise ScheduleError(
+                "fixed_cadence() cannot be combined with to(): "
+                "a fixed cadence requires a fixed interval"
+            )
+        if not isinstance(max_catch_up, int) or max_catch_up < 1:
+            raise ScheduleValueError("max_catch_up must be a positive integer")
+        self.missed_policy = missed
+        self.max_catch_up = max_catch_up
         return self
 
     def until(
@@ -669,7 +781,7 @@ class Job:
         :return: ``True`` if the job should be run now.
         """
         assert self.next_run is not None, "must run _schedule_next_run before"
-        return datetime.datetime.now() >= self.next_run
+        return self._now() >= self.next_run
 
     def run(self):
         """
@@ -683,19 +795,111 @@ class Job:
                  deadline is reached.
 
         """
-        if self._is_overdue(datetime.datetime.now()):
+        if self.missed_policy is not None:
+            return self._run_fixed_cadence()
+
+        if self._is_overdue(self._now()):
             logger.debug("Cancelling job %s", self)
             return CancelJob
 
         logger.debug("Running job %s", self)
         ret = self.job_func()
-        self.last_run = datetime.datetime.now()
+        self.last_run = self._now()
         self._schedule_next_run()
 
         if self._is_overdue(self.next_run):
             logger.debug("Cancelling job %s", self)
             return CancelJob
         return ret
+
+    def _run_fixed_cadence(self):
+        """
+        Run the job on a fixed cadence.
+
+        The next run is anchored to the planned (logical) run times:
+        each run advances the schedule by exactly one interval from the
+        previously planned run, regardless of when runs actually
+        execute. Missed runs are handled according to self.missed_policy.
+
+        :return: The return value of the last executed `job_func`, or
+                 CancelJob if the job's deadline is reached or the job
+                 asked to be canceled.
+        """
+        assert self.next_run is not None, "must run _schedule_next_run before"
+        assert self.unit is not None, "must set a time unit before running"
+        period = datetime.timedelta(**{self.unit: self.interval})
+
+        if self.missed_policy == MISSED_SKIP:
+            if self._now() >= self.next_run + period:
+                # The planned run (and possibly more) was missed; skip
+                # the stale planned runs without executing them.
+                logger.debug("Skipping missed run(s) of job %s", self)
+                while self.next_run <= self._now():
+                    self.next_run += period
+                if self._is_overdue(self.next_run):
+                    logger.debug("Cancelling job %s", self)
+                    return CancelJob
+                return None
+            return self._run_planned(period)
+
+        if self.missed_policy == MISSED_CATCH_UP:
+            return self._run_catch_up(period)
+
+        # MISSED_COALESCE: no matter how many planned runs were missed,
+        # run once and jump to the first planned run in the future.
+        ret = self._run_planned(period)
+        if isinstance(ret, CancelJob) or ret is CancelJob:
+            return ret
+        while self.next_run <= self._now():
+            self.next_run += period
+        if self._is_overdue(self.next_run):
+            logger.debug("Cancelling job %s", self)
+            return CancelJob
+        return ret
+
+    def _run_planned(self, period: datetime.timedelta):
+        """
+        Run the job once for the currently planned run and plan the next
+        run exactly one period after it. The until() deadline is checked
+        against the planned run times.
+        """
+        if self._is_overdue(self.next_run):
+            logger.debug("Cancelling job %s", self)
+            return CancelJob
+        logger.debug("Running job %s", self)
+        ret = self.job_func()
+        self.last_run = self._now()
+        self.next_run += period
+        if isinstance(ret, CancelJob) or ret is CancelJob:
+            return CancelJob
+        if self._is_overdue(self.next_run):
+            logger.debug("Cancelling job %s", self)
+            return CancelJob
+        return ret
+
+    def _run_catch_up(self, period: datetime.timedelta):
+        """
+        Make up missed planned runs one by one, at most
+        self.max_catch_up runs per call. Catching up stops as soon as
+        the job returns CancelJob or raises an exception; any remaining
+        missed runs stay pending for the next run_pending() call.
+        """
+        ret = None
+        runs = 0
+        while runs < self.max_catch_up and self.next_run <= self._now():
+            ret = self._run_planned(period)
+            if isinstance(ret, CancelJob) or ret is CancelJob:
+                return CancelJob
+            runs += 1
+        return ret
+
+    def _now(self) -> datetime.datetime:
+        """
+        :return: The current datetime, using the scheduler's clock.
+        """
+        if self.scheduler is not None:
+            return self.scheduler.clock()
+        return datetime.datetime.now()
 
     def _schedule_next_run(self) -> None:
         """
@@ -714,7 +918,9 @@ class Job:
             interval = self.interval
 
         # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
+        now = self._now()
+        if self.at_time_zone is not None:
+            now = now.astimezone(self.at_time_zone)
 
         next_run = now
 

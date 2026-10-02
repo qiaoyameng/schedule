@@ -33,6 +33,14 @@ Classes
    :undoc-members:
 
 
+Missed run policies
+-------------------
+
+.. autodata:: schedule.MISSED_SKIP
+.. autodata:: schedule.MISSED_COALESCE
+.. autodata:: schedule.MISSED_CATCH_UP
+
+
 Exceptions
 ----------
 
